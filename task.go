@@ -27,6 +27,8 @@ import (
 // MBTileVersion mbtiles版本号
 const MBTileVersion = "1.2"
 
+const maxRetries = 3
+
 // Task 下载任务
 type Task struct {
 	ID                 string
@@ -143,7 +145,7 @@ func (task *Task) SetupMBTileTables() error {
 	if task.File == "" {
 		outdir := viper.GetString("output.directory")
 		os.MkdirAll(outdir, os.ModePerm)
-		task.File = filepath.Join(outdir, fmt.Sprintf("%s-z%d-%d.%s.mbtiles", task.Name, task.Min, task.Max, task.ID))
+		task.File = filepath.Join(outdir, task.Name+".mbtiles")
 	}
 	os.Remove(task.File)
 	db, err := sql.Open("sqlite3", task.File)
@@ -230,12 +232,44 @@ func (task *Task) saveTile(tile Tile) error {
 	return nil
 }
 
-// tileFetcher 瓦片加载器
+// fetchTile 发送单次 HTTP 请求获取瓦片数据
+func fetchTile(tileURL string) ([]byte, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest("GET", tileURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://map.tianditu.gov.cn")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("状态码: %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+	if len(body) == 0 {
+		return nil, nil
+	}
+	return body, nil
+}
+
+// tileFetcher 瓦片加载器（带重试）
 func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	start := time.Now()
-	defer task.tileWG.Done() //结束该瓦片请求
+	defer task.tileWG.Done()
 	defer func() {
-		<-task.workers //workers完成并清退
+		<-task.workers
 	}()
 
 	prep := func(t maptile.Tile, url string) string {
@@ -246,52 +280,38 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 		url = strings.Replace(url, "{z}", strconv.Itoa(int(t.Z)), -1)
 		return url
 	}
-	tile := prep(mt, url)
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 自定义重定向的行为
-			return http.ErrUseLastResponse // 使用最后一个响应
-		},
+	tileURL := prep(mt, url)
+
+	if task.outformat != "mbtiles" {
+		filePath := filepath.Join(task.File, fmt.Sprintf(`%d`, mt.Z), fmt.Sprintf(`%d`, mt.X), fmt.Sprintf(`%d.%s`, mt.Y, task.TileMap.Format))
+		if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+			log.Debugf("tile(z:%d, x:%d, y:%d) 已存在，跳过", mt.Z, mt.X, mt.Y)
+			return
+		}
 	}
-	req, err := http.NewRequest("GET", tile, nil)
+
+	var body []byte
+	var err error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		body, err = fetchTile(tileURL)
+		if err == nil {
+			break
+		}
+		log.Warnf("tile(z:%d, x:%d, y:%d) 第%d次失败: %s", mt.Z, mt.X, mt.Y, attempt, err)
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
 	if err != nil {
-		fmt.Println("创建请求失败:", err)
+		log.Errorf("tile(z:%d, x:%d, y:%d) 重试%d次后仍失败: %s", mt.Z, mt.X, mt.Y, maxRetries, err)
+		return
+	}
+	if body == nil {
+		log.Warnf("nil tile %v ~", mt)
 		return
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://map.tianditu.gov.cn")
-	// req.Header.Set("Referer", "https://jiangsu.tianditu.gov.cn")
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("发送请求失败:", err)
-		return
-	}
-	defer resp.Body.Close()
-	// resp, err := http.Get(tile)
-	// if err != nil {
-	// 	log.Errorf("fetch :%s error, details: %s ~", tile, err)
-	// 	return
-	// }
-	// defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		log.Errorf("fetch %v tile error, status code: %d ~", tile, resp.StatusCode)
-		return
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Errorf("read %v tile error ~ %s", mt, err)
-		return
-	}
-	if len(body) == 0 {
-		log.Warnf("nil tile %v ~", mt)
-		return //zero byte tiles n
-	}
-	// tiledata
-	td := Tile{
-		T: mt,
-		C: body,
-	}
+	td := Tile{T: mt, C: body}
 
 	if task.TileMap.Format == PBF {
 		var buf bytes.Buffer
@@ -306,16 +326,14 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 		td.C = buf.Bytes()
 	}
 
-	//enable savingpipe
 	if task.outformat == "mbtiles" {
 		task.savingpipe <- td
 	} else {
-		// task.wg.Add(1)
 		task.saveTile(td)
 	}
 
 	cost := time.Since(start).Milliseconds()
-	log.Infof("tile(z:%d, x:%d, y:%d), %dms , %.2f kb, %s ...\n", mt.Z, mt.X, mt.Y, cost, float32(len(body))/1024.0, tile)
+	log.Infof("tile(z:%d, x:%d, y:%d), %dms , %.2f kb, %s ...\n", mt.Z, mt.X, mt.Y, cost, float32(len(body))/1024.0, tileURL)
 }
 
 // DownloadZoom 下载指定层级
@@ -370,7 +388,7 @@ func (task *Task) Download() {
 	} else {
 		if task.File == "" {
 			outdir := viper.GetString("output.directory")
-			task.File = filepath.Join(outdir, fmt.Sprintf("%s-z%d-%d.%s", task.Name, task.Min, task.Max, task.ID))
+			task.File = filepath.Join(outdir, task.Name)
 		}
 		os.MkdirAll(task.File, os.ModePerm)
 	}
