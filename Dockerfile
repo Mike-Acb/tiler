@@ -10,6 +10,4 @@ FROM alpine:3.18
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /app/tiler .
-COPY conf.toml .
-COPY geojson/ ./geojson/
-ENTRYPOINT ["./tiler", "-c", "/app/conf.toml"]
+ENTRYPOINT ["./tiler", "-c", "/etc/tiler/conf.toml"]
