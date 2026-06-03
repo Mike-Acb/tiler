@@ -52,9 +52,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build & push pmtiles-sync
+        uses: docker/build-push-action@v6
+        with:
+          context: pmtiles-sync
+          file: pmtiles-sync/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.repo }}/pmtiles-sync:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=pmtiles-sync
+          cache-to: type=gha,mode=max,scope=pmtiles-sync
+
       - name: Summary
         run: |
           echo "### 拉取地址" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "ghcr.io/${{ steps.meta.outputs.repo }}/pmtiles-sync:${{ steps.meta.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
