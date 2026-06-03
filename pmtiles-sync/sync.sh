@@ -6,6 +6,7 @@ MINIO_ENDPOINT="${MINIO_ENDPOINT:?MINIO_ENDPOINT is required}"
 MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}"
 MINIO_SECRET_KEY="${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}"
 MINIO_BUCKET="${MINIO_BUCKET:-open}"
+MINIO_PATH="${MINIO_PATH:-}"
 WORK_DIR="/tmp/pmtiles-work"
 
 echo "==> Configuring MinIO client..."
@@ -42,10 +43,15 @@ for tiledir in "${dirs[@]}"; do
     pmtiles convert "$mbtiles_file" "$pmtiles_file"
 
     echo "    Uploading to MinIO..."
-    mc cp "$pmtiles_file" "store/${MINIO_BUCKET}/${safe_name}.pmtiles"
+    if [ -n "$MINIO_PATH" ]; then
+        dest="store/${MINIO_BUCKET}/${MINIO_PATH}/${safe_name}.pmtiles"
+    else
+        dest="store/${MINIO_BUCKET}/${safe_name}.pmtiles"
+    fi
+    mc cp "$pmtiles_file" "$dest"
 
     rm -f "$mbtiles_file" "$pmtiles_file"
-    echo "    Done: ${safe_name}.pmtiles -> ${MINIO_BUCKET}"
+    echo "    Done: ${safe_name}.pmtiles -> $dest"
 done
 
 echo "==> All tilesets synced successfully"
