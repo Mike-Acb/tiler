@@ -1,6 +1,8 @@
 name: Build my image (GHCR only)
 
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       tag:
