@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS pmtiles-builder
+FROM golang:1.25-alpine AS pmtiles-builder
 RUN go install github.com/protomaps/go-pmtiles/cmd/pmtiles@latest
 
 FROM python:3.11-slim
