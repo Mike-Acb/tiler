@@ -282,14 +282,6 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	}
 	tileURL := prep(mt, url)
 
-	if task.outformat != "mbtiles" {
-		filePath := filepath.Join(task.File, fmt.Sprintf(`%d`, mt.Z), fmt.Sprintf(`%d`, mt.X), fmt.Sprintf(`%d.%s`, mt.Y, task.TileMap.Format))
-		if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
-			log.Debugf("tile(z:%d, x:%d, y:%d) 已存在，跳过", mt.Z, mt.X, mt.Y)
-			return
-		}
-	}
-
 	var body []byte
 	var err error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -348,6 +340,16 @@ func (task *Task) downloadLayer(layer Layer) {
 	go tilecover.CollectionChannel(layer.Collection, maptile.Zoom(layer.Zoom), tilelist)
 
 	for tile := range tilelist {
+		// 文件模式下，已存在的 tile 直接跳过，不走 sleep 和 worker
+		if task.outformat != "mbtiles" {
+			filePath := filepath.Join(task.File, fmt.Sprintf(`%d`, tile.Z), fmt.Sprintf(`%d`, tile.X), fmt.Sprintf(`%d.%s`, tile.Y, task.TileMap.Format))
+			if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+				log.Debugf("tile(z:%d, x:%d, y:%d) 已存在，跳过", tile.Z, tile.X, tile.Y)
+				bar.Increment()
+				task.Bar.Increment()
+				continue
+			}
+		}
 		// log.Infof(`fetching tile %v ~`, tile)
 		select {
 		case task.workers <- tile:
