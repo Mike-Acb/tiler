@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "guatemala",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "id": null, "name": "瓜地马拉" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -92.236, 13.735 ], [ -92.236, 17.819 ], [ -88.223, 17.819 ], [ -88.223, 13.735 ], [ -92.236, 13.735 ] ] ] } }
+]
+}
