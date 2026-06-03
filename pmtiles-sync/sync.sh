@@ -28,7 +28,7 @@ process_dir() {
     echo "==> Processing: $name"
 
     local format
-    format=$(find "$tiledir" -type f -name '*.*' | head -1 | sed 's/.*\.//')
+    format=$(find "$tiledir" -type f -name '*.*' -print -quit | sed 's/.*\.//')
     if [ -z "$format" ]; then
         echo "    Skipping: no tile files found"
         return
