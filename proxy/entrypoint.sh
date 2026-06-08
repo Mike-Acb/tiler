@@ -16,7 +16,7 @@ SWITCH_TRIGGER="/tmp/proxy/switch"
 GOST_PID=""
 CURRENT_PROXY=""
 
-log() { echo "[proxy] $*"; }
+log() { echo "[proxy] $*" >&2; }
 
 # ── Mode 1: fixed upstream ──
 if [ -n "${UPSTREAM_PROXY:-}" ]; then

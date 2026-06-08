@@ -314,6 +314,9 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	}()
 
 	prep := func(t maptile.Tile, url string) string {
+		if os.Getenv("HTTP_PROXY") != "" {
+			url = strings.Replace(url, "https://", "http://", 1)
+		}
 		url = strings.Replace(url, "{x}", strconv.Itoa(int(t.X)), -1)
 		url = strings.Replace(url, "{y}", strconv.Itoa(int(t.Y)), -1)
 		maxY := int(math.Pow(2, float64(t.Z))) - 1
