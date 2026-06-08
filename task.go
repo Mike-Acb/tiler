@@ -27,7 +27,6 @@ import (
 // MBTileVersion mbtiles版本号
 const MBTileVersion = "1.2"
 
-const maxRetries = 3
 
 // Task 下载任务
 type Task struct {
@@ -251,6 +250,13 @@ func fetchTile(tileURL string) ([]byte, error) {
 		return nil, fmt.Errorf("发送请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return nil, nil
+	}
+	if resp.StatusCode == 418 {
+		triggerProxySwitch()
+		return nil, fmt.Errorf("状态码: 418 (IP被封禁，已触发切换代理)")
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("状态码: %d", resp.StatusCode)
 	}
@@ -264,7 +270,23 @@ func fetchTile(tileURL string) ([]byte, error) {
 	return body, nil
 }
 
-// tileFetcher 瓦片加载器（带重试）
+var proxySwitchOnce sync.Once
+
+func triggerProxySwitch() {
+	proxySwitchOnce.Do(func() {
+		path := "/tmp/proxy/switch"
+		if err := os.WriteFile(path, []byte("418"), 0644); err != nil {
+			log.Warnf("触发代理切换失败: %s", err)
+			return
+		}
+		log.Warn("已触发代理切换 (418)")
+		go func() {
+			time.Sleep(10 * time.Second)
+			proxySwitchOnce = sync.Once{}
+		}()
+	})
+}
+
 func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	start := time.Now()
 	defer task.tileWG.Done()
@@ -282,20 +304,9 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	}
 	tileURL := prep(mt, url)
 
-	var body []byte
-	var err error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		body, err = fetchTile(tileURL)
-		if err == nil {
-			break
-		}
-		log.Warnf("tile(z:%d, x:%d, y:%d) 第%d次失败: %s", mt.Z, mt.X, mt.Y, attempt, err)
-		if attempt < maxRetries {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
+	body, err := fetchTile(tileURL)
 	if err != nil {
-		log.Errorf("tile(z:%d, x:%d, y:%d) 重试%d次后仍失败: %s", mt.Z, mt.X, mt.Y, maxRetries, err)
+		log.Errorf("tile(z:%d, x:%d, y:%d) 下载失败: %s", mt.Z, mt.X, mt.Y, err)
 		return
 	}
 	if body == nil {
