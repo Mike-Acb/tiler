@@ -4,7 +4,9 @@ set -e
 PORT="${LISTEN_PORT:-8080}"
 POOL_API="${PROXY_POOL_API:-http://proxy-pool:5010}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-15}"
-TEST_URL="${PROXY_TEST_URL:-https://t0.tianditu.gov.cn/}"
+TEST_URL="${PROXY_TEST_URL:-http://t0.tianditu.gov.cn/DataServer?T=vec_w&x=0&y=0&l=1&tk=75f0434f240669f4a2df6359275146d2}"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+REFERER="https://map.tianditu.gov.cn"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-3}"
 MAX_TIME="${MAX_TIME:-5}"
 PRE_TEST_BATCH="${PRE_TEST_BATCH:-10}"
@@ -51,7 +53,7 @@ delete_from_pool() {
 test_proxy_direct() {
     curl -sf --proxy "http://$1" \
          --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-         -o /dev/null "$TEST_URL" 2>/dev/null
+         -o /dev/null -H "User-Agent: $UA" -H "Referer: $REFERER" "$TEST_URL" 2>/dev/null
 }
 
 get_proxy() {
@@ -86,7 +88,8 @@ get_proxy() {
         cat "$candidates" | xargs -P "$count" -I{} sh -c '
             if curl -sf --proxy "http://{}" \
                    --connect-timeout '"$CONNECT_TIMEOUT"' --max-time '"$MAX_TIME"' \
-                   -o /dev/null "'"$TEST_URL"'" 2>/dev/null; then
+                   -o /dev/null -H "User-Agent: '"$UA"'" -H "Referer: '"$REFERER"'" \
+                   "'"$TEST_URL"'" 2>/dev/null; then
                 echo "{}" >> "'"$winner"'"
             fi
         ' 2>/dev/null || true
@@ -151,7 +154,7 @@ start_gost() {
 health_check() {
     curl -sf --proxy "http://localhost:${PORT}" \
          --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-         -o /dev/null "$TEST_URL" 2>/dev/null
+         -o /dev/null -H "User-Agent: $UA" -H "Referer: $REFERER" "$TEST_URL" 2>/dev/null
 }
 
 switch_proxy() {
