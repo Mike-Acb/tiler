@@ -287,6 +287,25 @@ func triggerProxySwitch() {
 	})
 }
 
+func proxyReady() bool {
+	if os.Getenv("HTTP_PROXY") == "" && os.Getenv("HTTPS_PROXY") == "" {
+		return true
+	}
+	_, err := os.Stat("/tmp/proxy/ready")
+	return err == nil
+}
+
+func waitForProxy() {
+	if proxyReady() {
+		return
+	}
+	log.Warn("代理未就绪，等待中...")
+	for !proxyReady() {
+		time.Sleep(2 * time.Second)
+	}
+	log.Info("代理已就绪，继续下载")
+}
+
 func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	start := time.Now()
 	defer task.tileWG.Done()
@@ -304,6 +323,7 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	}
 	tileURL := prep(mt, url)
 
+	waitForProxy()
 	body, err := fetchTile(tileURL)
 	if err != nil {
 		log.Errorf("tile(z:%d, x:%d, y:%d) 下载失败: %s", mt.Z, mt.X, mt.Y, err)

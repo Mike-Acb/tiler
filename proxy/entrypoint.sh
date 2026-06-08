@@ -16,6 +16,8 @@ log() { echo "[proxy] $*"; }
 # ── Mode 1: fixed upstream ──
 if [ -n "${UPSTREAM_PROXY:-}" ]; then
     log "fixed upstream: $UPSTREAM_PROXY"
+    mkdir -p /tmp/proxy
+    touch /tmp/proxy/ready
     exec gost -L "http://:${PORT}" -F "$UPSTREAM_PROXY"
 fi
 
@@ -91,8 +93,12 @@ wait_for_proxies() {
     return 1
 }
 
+mark_ready()   { touch /tmp/proxy/ready; }
+mark_unready() { rm -f /tmp/proxy/ready; }
+
 start_gost() {
     if [ -n "$GOST_PID" ]; then
+        mark_unready
         kill "$GOST_PID" 2>/dev/null || true
         wait "$GOST_PID" 2>/dev/null || true
     fi
@@ -101,6 +107,7 @@ start_gost() {
     gost -L "http://:${PORT}" -F "http://${CURRENT_PROXY}" &
     GOST_PID=$!
     sleep 1
+    mark_ready
 }
 
 health_check() {
