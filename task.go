@@ -433,4 +433,7 @@ func (task *Task) Download() {
 		task.downloadLayer(layer)
 	}
 	task.Bar.FinishPrint(fmt.Sprintf("Task %s finished ~", task.ID))
+
+	outdir := viper.GetString("output.directory")
+	os.WriteFile(filepath.Join(outdir, ".done"), []byte("done"), 0644)
 }

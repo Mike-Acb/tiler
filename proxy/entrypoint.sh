@@ -162,7 +162,12 @@ switch_proxy() {
     blacklist_add "$CURRENT_PROXY"
     delete_from_pool "$CURRENT_PROXY"
     local new_proxy
-    new_proxy=$(get_proxy) || { log "WARN: no proxy available"; return 1; }
+    while true; do
+        new_proxy=$(get_proxy) && break
+        log "WARN: no proxy available, pausing downloads, retry in 30s..."
+        mark_unready
+        sleep 30
+    done
     start_gost "$new_proxy"
 }
 
@@ -204,8 +209,13 @@ monitor() {
 # ── main ──
 log "config: timeout=${CONNECT_TIMEOUT}/${MAX_TIME}s, health=${HEALTH_INTERVAL}s, batch=${PRE_TEST_BATCH}"
 log "test url: $TEST_URL"
-wait_for_pool || { log "fallback: direct (no proxy)"; touch /tmp/proxy/ready; exec gost -L "http://:${PORT}"; }
+wait_for_pool || { log "proxy_pool not reachable, exiting"; exit 1; }
 
-first=$(get_proxy) || { log "fallback: direct (no proxy)"; touch /tmp/proxy/ready; exec gost -L "http://:${PORT}"; }
+while true; do
+    first=$(get_proxy) && break
+    log "no proxy available at startup, retry in 30s..."
+    mark_unready
+    sleep 30
+done
 start_gost "$first"
 monitor

@@ -2,6 +2,12 @@
 set -euo pipefail
 
 INPUT_DIR="${INPUT_DIR:-/data/output}"
+
+echo "==> Waiting for download to finish..."
+while [ ! -f "$INPUT_DIR/.done" ]; do
+    sleep 10
+done
+echo "==> Download complete, starting sync"
 MINIO_ENDPOINT="${MINIO_ENDPOINT:?MINIO_ENDPOINT is required}"
 MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}"
 MINIO_SECRET_KEY="${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}"
