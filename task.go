@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -251,7 +252,7 @@ func fetchTile(tileURL string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 404 {
-		return nil, nil
+		return nil, errNotFound
 	}
 	if resp.StatusCode == 418 {
 		triggerProxySwitch()
@@ -270,6 +271,7 @@ func fetchTile(tileURL string) ([]byte, error) {
 	return body, nil
 }
 
+var errNotFound = errors.New("404")
 var proxySwitchOnce sync.Once
 
 func triggerProxySwitch() {
@@ -328,6 +330,16 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 
 	waitForProxy()
 	body, err := fetchTile(tileURL)
+	if errors.Is(err, errNotFound) {
+		log.Debugf("nil tile %v (404)", mt)
+		if task.outformat != "mbtiles" {
+			dir := filepath.Join(task.File, fmt.Sprintf(`%d`, mt.Z), fmt.Sprintf(`%d`, mt.X))
+			os.MkdirAll(dir, os.ModePerm)
+			emptyFile := filepath.Join(dir, fmt.Sprintf(`%d.%s`, mt.Y, task.TileMap.Format))
+			os.WriteFile(emptyFile, []byte{}, os.ModePerm)
+		}
+		return
+	}
 	if err != nil {
 		log.Errorf("tile(z:%d, x:%d, y:%d) 下载失败: %s", mt.Z, mt.X, mt.Y, err)
 		return
@@ -377,7 +389,7 @@ func (task *Task) downloadLayer(layer Layer) {
 		// 文件模式下，已存在的 tile 直接跳过，不走 sleep 和 worker
 		if task.outformat != "mbtiles" {
 			filePath := filepath.Join(task.File, fmt.Sprintf(`%d`, tile.Z), fmt.Sprintf(`%d`, tile.X), fmt.Sprintf(`%d.%s`, tile.Y, task.TileMap.Format))
-			if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+			if _, err := os.Stat(filePath); err == nil {
 				log.Debugf("tile(z:%d, x:%d, y:%d) 已存在，跳过", tile.Z, tile.X, tile.Y)
 				bar.Increment()
 				task.Bar.Increment()
