@@ -1,9 +1,10 @@
 module tiler
 
-go 1.15
+go 1.16
 
 require (
 	github.com/antonfisher/nested-logrus-formatter v1.3.0
+	github.com/gorilla/websocket v1.4.2
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/mattn/go-sqlite3 v1.14.19
 	github.com/paulmach/orb v0.1.6

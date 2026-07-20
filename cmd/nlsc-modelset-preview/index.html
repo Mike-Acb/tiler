@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Taichung 3D Buildings</title>
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.143/Build/Cesium/Cesium.js"></script>
+  <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.143/Build/Cesium/Widgets/widgets.css">
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body, #cesium { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #061016; }
+    .panel {
+      position: fixed; z-index: 10; top: 18px; left: 18px; width: min(340px, calc(100vw - 36px));
+      padding: 18px; border: 1px solid rgba(145, 214, 198, .22); border-radius: 16px;
+      background: rgba(5, 17, 22, .86); box-shadow: 0 18px 60px rgba(0, 0, 0, .35);
+      backdrop-filter: blur(18px);
+    }
+    .eyebrow { color: #78d6be; font-size: 11px; font-weight: 750; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin: 7px 0 4px; color: #f3faf7; font-size: 22px; letter-spacing: -.025em; }
+    .subtitle { margin: 0 0 16px; color: #91a9a3; font-size: 12px; line-height: 1.5; }
+    .status-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .status { display: flex; align-items: center; gap: 8px; min-width: 0; color: #c9dad5; font-size: 12px; }
+    .dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #e8b86d; box-shadow: 0 0 12px currentColor; }
+    .dot.ready { background: #53d39e; }
+    .dot.error { background: #ff6d75; }
+    .metric { color: #68807a; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+    .control { margin-top: 12px; }
+    .control-head { display: flex; justify-content: space-between; margin-bottom: 7px; color: #9db2ad; font-size: 11px; }
+    input[type="range"] { width: 100%; accent-color: #5dd1b4; }
+    .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 14px 0; }
+    label.check { display: flex; align-items: center; gap: 7px; color: #aabcb7; font-size: 11px; cursor: pointer; }
+    input[type="checkbox"] { accent-color: #5dd1b4; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    button {
+      border: 1px solid rgba(145, 214, 198, .2); border-radius: 9px; padding: 9px 11px;
+      color: #d9e8e4; background: rgba(104, 177, 159, .1); font: 600 11px inherit; cursor: pointer;
+    }
+    button:hover { background: rgba(104, 177, 159, .2); }
+    .error-box { display: none; margin-top: 12px; padding: 10px; border-radius: 8px; color: #ffc5c8; background: rgba(129, 29, 37, .28); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+    .error-box.visible { display: block; }
+    .cesium-viewer-bottom { left: auto; right: 8px; }
+    @media (max-width: 620px) { .panel { top: 10px; left: 10px; width: calc(100vw - 20px); } }
+  </style>
+</head>
+<body>
+  <div id="cesium"></div>
+  <section class="panel" aria-label="3D tiles controls">
+    <div class="eyebrow">NLSC · 113_B · L3–L11</div>
+    <h1>Taichung 3D Buildings</h1>
+    <p class="subtitle">Local textured 3D Tiles streamed from the SMB archive.</p>
+    <div class="status-row">
+      <div class="status"><span id="dot" class="dot"></span><span id="status">Starting Cesium…</span></div>
+      <span id="metric" class="metric">0 tiles</span>
+    </div>
+    <div class="control">
+      <div class="control-head"><span>Detail / network load</span><span id="sseValue">0.5 px</span></div>
+      <input id="sse" type="range" min="0.25" max="32" step="0.25" value="0.5">
+    </div>
+    <div class="checks">
+      <label class="check"><input id="satellite" type="checkbox" checked> Satellite imagery</label>
+      <label class="check"><input id="unlit" type="checkbox" checked> Unlit colors</label>
+      <label class="check"><input id="bounds" type="checkbox"> Tile bounds</label>
+      <label class="check"><input id="fps" type="checkbox"> FPS meter</label>
+      <label class="check"><input id="wireframe" type="checkbox"> Wireframe</label>
+    </div>
+    <div class="actions">
+      <button id="home" type="button">Frame dataset</button>
+      <button id="reload" type="button">Reload tiles</button>
+    </div>
+    <div id="error" class="error-box"></div>
+  </section>
+  <script>
+    const statusEl = document.querySelector("#status");
+    const dotEl = document.querySelector("#dot");
+    const metricEl = document.querySelector("#metric");
+    const errorEl = document.querySelector("#error");
+    const tilesets = [];
+    const unlitShaders = new Map();
+    const search = new URLSearchParams(location.search);
+    const focus = {
+      longitude: Number(search.get("lon")),
+      latitude: Number(search.get("lat")),
+      height: Number(search.get("height"))
+    };
+    const hasFocus = search.has("lon") && search.has("lat") && search.has("height") &&
+      Number.isFinite(focus.longitude) && Number.isFinite(focus.latitude) && Number.isFinite(focus.height);
+    let residentTiles = 0;
+
+    function setStatus(message, kind = "loading") {
+      statusEl.textContent = message;
+      dotEl.className = `dot ${kind === "loading" ? "" : kind}`;
+    }
+
+    function showError(error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus("Load failed", "error");
+      errorEl.textContent = message;
+      errorEl.classList.add("visible");
+      console.error(error);
+    }
+
+    const viewer = new Cesium.Viewer("cesium", {
+      baseLayer: false,
+      baseLayerPicker: false,
+      geocoder: false,
+      homeButton: false,
+      sceneModePicker: false,
+      navigationHelpButton: false,
+      animation: false,
+      timeline: false,
+      infoBox: false,
+      selectionIndicator: false,
+      scene3DOnly: true
+    });
+    viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#07141b");
+    viewer.scene.backgroundColor = Cesium.Color.fromCssColorString("#061016");
+    viewer.scene.globe.enableLighting = true;
+
+    let satelliteLayer;
+
+    async function loadSatellite() {
+      try {
+        const provider = await Cesium.ArcGisMapServerImageryProvider.fromUrl(
+          "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer",
+          { enablePickFeatures: false }
+        );
+        satelliteLayer = viewer.imageryLayers.addImageryProvider(provider);
+        satelliteLayer.show = document.querySelector("#satellite").checked;
+      } catch (error) {
+        console.warn("Satellite imagery unavailable", error);
+      }
+    }
+
+    async function loadTileset(url) {
+      const tileset = await Cesium.Cesium3DTileset.fromUrl(url, {
+        maximumScreenSpaceError: Number(document.querySelector("#sse").value),
+        dynamicScreenSpaceError: false,
+        skipLevelOfDetail: false,
+        cacheBytes: 512 * 1024 * 1024,
+        shadows: Cesium.ShadowMode.DISABLED
+      });
+      const unlitShader = new Cesium.CustomShader({
+        lightingModel: Cesium.LightingModel.UNLIT
+      });
+      unlitShaders.set(tileset, unlitShader);
+      if (document.querySelector("#unlit").checked) {
+        tileset.customShader = unlitShader;
+      }
+      viewer.scene.primitives.add(tileset);
+      tilesets.push(tileset);
+      tileset.tileLoad.addEventListener(() => {
+        residentTiles += 1;
+        metricEl.textContent = `${residentTiles.toLocaleString()} tiles`;
+        setStatus("Streaming buildings…");
+      });
+      tileset.tileUnload.addEventListener(() => {
+        residentTiles = Math.max(0, residentTiles - 1);
+        metricEl.textContent = `${residentTiles.toLocaleString()} tiles`;
+      });
+      tileset.tileFailed.addEventListener((error) => showError(error.message || error));
+      tileset.allTilesLoaded.addEventListener(() => setStatus("View loaded", "ready"));
+    }
+
+    async function loadTilesets() {
+      try {
+        setStatus("Reading tilesets…");
+        const response = await fetch("/tile-sources.json");
+        if (!response.ok) throw new Error(`Tile source list: HTTP ${response.status}`);
+        const sources = await response.json();
+        await Promise.all(sources.map(loadTileset));
+        await frameView();
+        setStatus("Streaming buildings…");
+      } catch (error) {
+        showError(error);
+      }
+    }
+
+    async function frameView() {
+      if (!hasFocus) {
+        await viewer.zoomTo(tilesets[0], new Cesium.HeadingPitchRange(0, -0.55, 0));
+        return;
+      }
+      const target = Cesium.Cartesian3.fromDegrees(focus.longitude, focus.latitude);
+      viewer.camera.lookAt(target, new Cesium.HeadingPitchRange(0, -0.7, focus.height));
+    }
+
+    document.querySelector("#sse").addEventListener("input", (event) => {
+      const value = Number(event.target.value);
+      document.querySelector("#sseValue").textContent = `${value} px`;
+      for (const tileset of tilesets) tileset.maximumScreenSpaceError = value;
+    });
+    document.querySelector("#satellite").addEventListener("change", (event) => {
+      if (satelliteLayer) satelliteLayer.show = event.target.checked;
+    });
+    document.querySelector("#unlit").addEventListener("change", (event) => {
+      for (const tileset of tilesets) {
+        tileset.customShader = event.target.checked ? unlitShaders.get(tileset) : undefined;
+      }
+    });
+    document.querySelector("#bounds").addEventListener("change", (event) => {
+      for (const tileset of tilesets) tileset.debugShowBoundingVolume = event.target.checked;
+    });
+    document.querySelector("#fps").addEventListener("change", (event) => {
+      viewer.scene.debugShowFramesPerSecond = event.target.checked;
+    });
+    document.querySelector("#wireframe").addEventListener("change", (event) => {
+      for (const tileset of tilesets) tileset.debugWireframe = event.target.checked;
+    });
+    document.querySelector("#home").addEventListener("click", () => { if (tilesets[0]) frameView(); });
+    document.querySelector("#reload").addEventListener("click", () => location.reload());
+    viewer.scene.renderError.addEventListener((_scene, error) => showError(error));
+    loadSatellite();
+    loadTilesets();
+  </script>
+</body>
+</html>

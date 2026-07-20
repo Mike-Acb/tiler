@@ -5,6 +5,12 @@ A well-polished tile downloader
 
 一个极速地图下载框架，支持谷歌、百度、高德、天地图、Mapbox、OSM、四维、易图通等。
 
+## NLSC 3D MODELSET
+
+项目同时提供 NLSC MODELSET 原始节点的可续传下载、带纹理 GLB 转换、3D Tiles
+1.1 层级构建和 CesiumJS 本地预览。完整的环境准备、命令参数、输出目录、断点恢复
+和双子树部署说明见 [NLSC MODELSET 下载与 3D Tiles 构建](nlscdownload/README.md)。
+
 - 支持多任务多线程配置，可任意设置
 
 - 支持不同层级设置不同下载范围，以加速下载
