@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 INPUT_DIR="${INPUT_DIR:-/data/output}"
 
 echo "==> Waiting for download to finish..."
@@ -34,7 +35,7 @@ process_dir() {
     echo "==> Processing: $name"
 
     local format
-    format=$(find "$tiledir" -type f -name '*.*' -print -quit | sed 's/.*\.//')
+    format=$("$SCRIPT_DIR/detect-format.sh" "$tiledir")
     if [ -z "$format" ]; then
         echo "    Skipping: no tile files found"
         return

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,6 @@ import (
 
 // MBTileVersion mbtiles版本号
 const MBTileVersion = "1.2"
-
 
 // Task 下载任务
 type Task struct {
@@ -97,9 +97,15 @@ func NewTask(layers []Layer, m TileMap) *Task {
 
 // Bound 范围
 func (task *Task) Bound() orb.Bound {
-	bound := orb.Bound{Min: orb.Point{1, 1}, Max: orb.Point{-1, -1}}
+	var bound orb.Bound
+	hasGeometry := false
 	for _, layer := range task.Layers {
 		for _, g := range layer.Collection {
+			if !hasGeometry {
+				bound = g.Bound()
+				hasGeometry = true
+				continue
+			}
 			bound = bound.Union(g.Bound())
 		}
 	}
@@ -109,8 +115,11 @@ func (task *Task) Bound() orb.Bound {
 // Center 中心点
 func (task *Task) Center() orb.Point {
 	layer := task.Layers[len(task.Layers)-1]
-	bound := orb.Bound{Min: orb.Point{1, 1}, Max: orb.Point{-1, -1}}
-	for _, g := range layer.Collection {
+	if len(layer.Collection) == 0 {
+		return orb.Point{}
+	}
+	bound := layer.Collection[0].Bound()
+	for _, g := range layer.Collection[1:] {
 		bound = bound.Union(g.Bound())
 	}
 	return bound.Center()
@@ -137,6 +146,17 @@ func (task *Task) MetaItems() map[string]string {
 		"json":        task.TileMap.JSON,
 	}
 	return data
+}
+
+func (task *Task) writeFileMetadata() error {
+	data, err := json.MarshalIndent(task.MetaItems(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("生成 metadata.json 失败: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(task.File, "metadata.json"), data, 0644); err != nil {
+		return fmt.Errorf("写入 metadata.json 失败: %w", err)
+	}
+	return nil
 }
 
 // SetupMBTileTables 初始化配置MBTile库
@@ -271,6 +291,34 @@ func fetchTile(tileURL string) ([]byte, error) {
 	return body, nil
 }
 
+func validateTileData(format string, body []byte) error {
+	if len(body) == 0 {
+		return errors.New("瓦片内容为空")
+	}
+
+	switch strings.ToLower(format) {
+	case JPG, "jpeg":
+		if contentType := http.DetectContentType(body); contentType != "image/jpeg" {
+			return fmt.Errorf("期望 image/jpeg，实际为 %s", contentType)
+		}
+	case PNG:
+		if contentType := http.DetectContentType(body); contentType != "image/png" {
+			return fmt.Errorf("期望 image/png，实际为 %s", contentType)
+		}
+	case WEBP:
+		if contentType := http.DetectContentType(body); contentType != "image/webp" {
+			return fmt.Errorf("期望 image/webp，实际为 %s", contentType)
+		}
+	case PBF:
+		// Vector tiles do not have a reliable magic number. A non-empty body is
+		// accepted here and is gzip-compressed before storage below.
+	default:
+		return fmt.Errorf("不支持的瓦片格式: %s", format)
+	}
+
+	return nil
+}
+
 var errNotFound = errors.New("404")
 var proxySwitchOnce sync.Once
 
@@ -346,6 +394,10 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	}
 	if body == nil {
 		log.Warnf("nil tile %v ~", mt)
+		return
+	}
+	if err := validateTileData(task.TileMap.Format, body); err != nil {
+		log.Errorf("tile(z:%d, x:%d, y:%d) 数据校验失败: %s", mt.Z, mt.X, mt.Y, err)
 		return
 	}
 
@@ -439,6 +491,10 @@ func (task *Task) Download() {
 			task.File = filepath.Join(outdir, task.Name)
 		}
 		os.MkdirAll(task.File, os.ModePerm)
+		if err := task.writeFileMetadata(); err != nil {
+			log.Errorf("写入文件瓦片元数据失败: %s", err)
+			return
+		}
 	}
 	go task.savePipe()
 	for _, layer := range task.Layers {
