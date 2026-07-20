@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Indian Ocean Preview</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+  #map { width: 100vw; height: 100vh; }
+  .info-panel {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: rgba(255,255,255,0.95); padding: 16px 20px;
+    border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    font-size: 14px; line-height: 1.8; min-width: 260px;
+  }
+  .info-panel h3 { margin-bottom: 8px; font-size: 16px; }
+  .info-panel .label { color: #666; }
+  .info-panel .value { font-weight: 600; color: #333; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="info-panel">
+  <h3>Indian Ocean BBox</h3>
+  <div><span class="label">West: </span><span class="value">20°E</span></div>
+  <div><span class="label">East: </span><span class="value">120°E</span></div>
+  <div><span class="label">South: </span><span class="value">-35°S</span></div>
+  <div><span class="label">North: </span><span class="value">30°N</span></div>
+  <div style="border-top:1px solid #eee; margin-top:8px; padding-top:8px;">
+    <div><span class="label">Width (lon): </span><span class="value" id="widthDeg"></span></div>
+    <div><span class="label">Height (lat): </span><span class="value" id="heightDeg"></span></div>
+    <div><span class="label">Approx width (at equator): </span><span class="value" id="widthKm"></span></div>
+    <div><span class="label">Approx height: </span><span class="value" id="heightKm"></span></div>
+    <div style="border-top:1px solid #eee; margin-top:8px; padding-top:8px;">
+      <span class="label">Approx area: </span><span class="value">~70,560,000 km²</span>
+    </div>
+    <div style="color:#999; font-size:12px; margin-top:4px;">
+      (official ~70.56M km², third largest ocean)
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const west = 20, east = 120, south = -35, north = 30;
+
+const geojson = {
+  "type": "FeatureCollection",
+  "features": [{
+    "type": "Feature",
+    "properties": { "name": "Indian Ocean" },
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [[
+        [west, south], [west, north],
+        [east, north], [east, south],
+        [west, south]
+      ]]
+    }
+  }]
+};
+
+const dLon = east - west;
+const dLat = north - south;
+const midLat = (south + north) / 2;
+const kmPerDegLat = 111.32;
+const kmPerDegLon = 111.32 * Math.cos(midLat * Math.PI / 180);
+const widthKm = dLon * kmPerDegLon;
+const heightKm = dLat * kmPerDegLat;
+
+document.getElementById('widthDeg').textContent = dLon.toFixed(1) + '°';
+document.getElementById('heightDeg').textContent = dLat.toFixed(1) + '°';
+document.getElementById('widthKm').textContent = (dLon * 111.32).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' km';
+document.getElementById('heightKm').textContent = heightKm.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' km';
+
+const map = L.map('map').setView([midLat, (west + east) / 2], 3);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap'
+}).addTo(map);
+
+L.geoJSON(geojson, {
+  style: {
+    color: '#3498db',
+    weight: 3,
+    fillColor: '#3498db',
+    fillOpacity: 0.15
+  }
+}).addTo(map);
+
+map.fitBounds([[south, west], [north, east]], { padding: [20, 20] });
+</script>
+</body>
+</html>
