@@ -20,12 +20,19 @@ POOL_SHOWN="${POOL_API%%\?*}" # 日志里不打印查询参数（含 key）
 if [ -z "${PROXY_MAX_AGE:-}" ]; then
     if [ "$FETCH_MODE" = 1 ]; then PROXY_MAX_AGE=50; else PROXY_MAX_AGE=0; fi
 fi
+# PROXY_COUNT：同时使用几个上游代理，请求在它们之间轮流分发（单个短效代理带宽有限，多个叠加提速）。
+# 不设时：提取链接取链接里的 num 参数，代理池为 1。
+if [ -z "${PROXY_COUNT:-}" ]; then
+    PROXY_COUNT=1
+    if [ "$FETCH_MODE" = 1 ]; then
+        n=$(echo "$POOL_API" | sed -n 's/.*[?&]num=\([0-9][0-9]*\).*/\1/p')
+        [ -n "$n" ] && [ "$n" -gt 0 ] && PROXY_COUNT=$n
+    fi
+fi
 
 BLACKLIST="/tmp/proxy/blacklist.txt"
 SWITCH_TRIGGER="/tmp/proxy/switch"
-GOST_PID=""
-CURRENT_PROXY=""
-STARTED_AT=0
+BASE_PORT=$((PORT + 1)) # 各上游代理槽位的本地端口：8081、8082……
 
 log() { echo "[proxy] $*" >&2; }
 
@@ -37,7 +44,10 @@ if [ -n "${UPSTREAM_PROXY:-}" ]; then
     exec gost -L "http://:${PORT}" -F "$UPSTREAM_PROXY"
 fi
 
-# ── Mode 2: proxy_pool API ──
+# ── Mode 2: proxy_pool API / 提取链接 ──
+#
+# 结构：tiler → :8080 前端 gost → 轮流转给 127.0.0.1:8081..808N 的槽位 gost → 各自的上游代理。
+# 每个槽位单独换代理（到期、坏掉），前端地址列表固定不变，不用重启；换的那个槽位上被掐断的请求由 tiler 重试。
 
 mkdir -p /tmp/proxy
 touch "$BLACKLIST"
@@ -49,12 +59,21 @@ blacklist_add() {
     [ -z "$1" ] && return
     if ! grep -qxF "$1" "$BLACKLIST" 2>/dev/null; then
         echo "$1" >> "$BLACKLIST"
-        log "blacklisted: $1 (total: $(wc -l < "$BLACKLIST" | tr -d ' '))"
     fi
 }
 
 is_blacklisted() {
     grep -qxF "$1" "$BLACKLIST" 2>/dev/null
+}
+
+# in_use：是否已在某个槽位上用着（提取链接可能返回重复的 IP）
+in_use() {
+    local i=1
+    while [ $i -le "$PROXY_COUNT" ]; do
+        [ "$(slot_get PROXY $i)" = "$1" ] && return 0
+        i=$((i + 1))
+    done
+    return 1
 }
 
 delete_from_pool() {
@@ -79,31 +98,34 @@ exit 1
 EOF
 chmod +x "$PROBE"
 
-get_proxy() {
+# get_proxies <n>：取最多 n 个测试可用的代理，每行一个；一个都没有时返回 1。
+get_proxies() {
+    local want="$1"
     local candidates="/tmp/proxy/candidates.txt"
-    local winner="/tmp/proxy/winner.txt"
-    : > "$candidates"
-    : > "$winner"
+    local winners="/tmp/proxy/winners.txt"
+    : > "$winners"
 
-    local batch=0 max_batches=5
-    # 提取链接每调用一次就扣一次额度：每批只调一次（取几个由链接里的 num 决定），一轮最多 3 批
+    local batch=0 max_batches=5 found=0
+    # 提取链接每调用一次就扣一次额度：每批只调一次，一次取还差的个数，一轮最多 3 批
     [ "$FETCH_MODE" = 1 ] && max_batches=3
     while [ $batch -lt $max_batches ]; do
         : > "$candidates"
+        local need=$((want - found))
         if [ "$FETCH_MODE" = 1 ]; then
-            curl -sf --max-time 8 "$POOL_API" 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{2,5}' | \
+            local url
+            url=$(echo "$POOL_API" | sed "s/\([?&]\)num=[0-9][0-9]*/\1num=${need}/")
+            curl -sf --max-time 8 "$url" 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{2,5}' | \
                 while IFS= read -r p; do
-                    is_blacklisted "$p" || grep -qxF "$p" "$candidates" 2>/dev/null || echo "$p" >> "$candidates"
+                    is_blacklisted "$p" || in_use "$p" || grep -qxF "$p" "$candidates" "$winners" 2>/dev/null || echo "$p" >> "$candidates"
                 done
         else
-            # Grab a batch of proxies from pool
-            local i=0
-            while [ $i -lt "$PRE_TEST_BATCH" ]; do
+            local i=0 limit=$((need > PRE_TEST_BATCH ? need : PRE_TEST_BATCH))
+            while [ $i -lt "$limit" ]; do
                 local p
                 p=$(curl -sf --max-time 3 "${POOL_API}/get/" 2>/dev/null | \
                     sed -n 's/.*"proxy"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
                 [ -z "$p" ] && break
-                if ! is_blacklisted "$p" && ! grep -qxF "$p" "$candidates" 2>/dev/null; then
+                if ! is_blacklisted "$p" && ! in_use "$p" && ! grep -qxF "$p" "$candidates" "$winners" 2>/dev/null; then
                     echo "$p" >> "$candidates"
                 fi
                 i=$((i + 1))
@@ -112,41 +134,32 @@ get_proxy() {
 
         local count
         count=$(wc -l < "$candidates" | tr -d ' ')
-        [ "$count" -eq 0 ] && { batch=$((batch + 1)); sleep 5; continue; }
-
-        log "testing $count proxies (parallel)..."
-
-        # Parallel test: first one to succeed wins
-        cat "$candidates" | xargs -P "$count" -I{} sh -c '
-            if "$1" "http://$4$2"; then echo "$2" >> "$3"; fi
-        ' _ "$PROBE" {} "$winner" "$AUTH_PREFIX" 2>/dev/null || true
-
-        if [ -s "$winner" ]; then
-            local result
-            result=$(head -1 "$winner")
-            log "found working proxy: $result"
-            # Blacklist the rest that didn't work
-            while IFS= read -r p; do
-                if ! grep -qxF "$p" "$winner" 2>/dev/null; then
-                    blacklist_add "$p"
-                    delete_from_pool "$p"
-                fi
-            done < "$candidates"
-            echo "$result"
-            return 0
+        if [ "$count" -eq 0 ]; then
+            log "batch $((batch + 1)): no new proxy returned"
+            batch=$((batch + 1)); sleep 5; continue
         fi
 
-        # All failed, blacklist them
+        # 并行测试，可用的追加到 winners
+        xargs -P "$count" -I{} sh -c '
+            if "$1" "http://$4$2"; then echo "$2" >> "$3"; fi
+        ' _ "$PROBE" {} "$winners" "$AUTH_PREFIX" < "$candidates" 2>/dev/null || true
+
+        # 没通过测试的拉黑，免得再拿到
         while IFS= read -r p; do
-            blacklist_add "$p"
-            delete_from_pool "$p"
+            if ! grep -qxF "$p" "$winners" 2>/dev/null; then
+                blacklist_add "$p"
+                delete_from_pool "$p"
+            fi
         done < "$candidates"
-        log "batch $((batch + 1)) all failed, retrying..."
+
+        found=$(wc -l < "$winners" | tr -d ' ')
+        log "batch $((batch + 1)): $count candidates, $found/$want usable"
+        [ "$found" -ge "$want" ] && break
         batch=$((batch + 1))
     done
 
-    log "no working proxy found after $batch batches"
-    return 1
+    [ "$found" -eq 0 ] && return 1
+    head -n "$want" "$winners"
 }
 
 wait_for_pool() {
@@ -168,114 +181,172 @@ wait_for_pool() {
     return 1
 }
 
-start_gost() {
-    mark_unready
-    if [ -n "$GOST_PID" ]; then
-        kill "$GOST_PID" 2>/dev/null || true
-        wait "$GOST_PID" 2>/dev/null || true
+# ── 槽位：SLOT_PROXY_i / SLOT_PID_i / SLOT_AT_i ──
+
+slot_get() { eval "echo \"\${SLOT_${1}_${2}:-}\""; }  # slot_get PROXY 3
+slot_set() { eval "SLOT_${1}_${2}=\"\$3\""; }         # slot_set PROXY 3 1.2.3.4:5
+
+slot_stop() {
+    local pid
+    pid=$(slot_get PID "$1")
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
     fi
-    CURRENT_PROXY="$1"
-    STARTED_AT=$(date +%s)
-    log "using proxy: $CURRENT_PROXY"
-    gost -L "http://:${PORT}" -F "http://${AUTH_PREFIX}${CURRENT_PROXY}" &
-    GOST_PID=$!
-    sleep 1
-    mark_ready
+    slot_set PID "$1" ""
+    slot_set PROXY "$1" ""
 }
 
-health_check() {
-    "$PROBE" "http://localhost:${PORT}"
+slot_start() {
+    local i="$1" p="$2"
+    slot_stop "$i"
+    gost -L "http://127.0.0.1:$((BASE_PORT + i - 1))" -F "http://${AUTH_PREFIX}${p}" 2>/dev/null &
+    slot_set PID "$i" $!
+    slot_set PROXY "$i" "$p"
+    slot_set AT "$i" "$(date +%s)"
 }
 
-# rotate_proxy：当前代理快到期时提前换。先拿到可用的新代理再切过去，拿不到就继续用当前的，15 秒后再试。
-rotate_proxy() {
-    log "rotating (used ${PROXY_MAX_AGE}s): $CURRENT_PROXY"
-    blacklist_add "$CURRENT_PROXY" # 免得提取链接又返回同一个
-    local new_proxy
-    if new_proxy=$(get_proxy); then
-        start_gost "$new_proxy"
-    else
-        log "WARN: rotate failed, keep current for now"
-        STARTED_AT=$((STARTED_AT + 15))
-    fi
-}
-
-switch_proxy() {
-    log "switching from: $CURRENT_PROXY"
-    mark_unready # 当前代理已坏：立刻让 tiler 暂停发请求，等新代理就绪
-    blacklist_add "$CURRENT_PROXY"
-    delete_from_pool "$CURRENT_PROXY"
-    local new_proxy wait_s=30
-    while true; do
-        new_proxy=$(get_proxy) && break
-        log "WARN: no proxy available, pausing downloads, retry in ${wait_s}s..."
-        mark_unready
-        sleep "$wait_s"
-        wait_s=$((wait_s * 2)); [ "$wait_s" -gt 300 ] && wait_s=300 # 逐步拉长，避免空耗提取额度
+slots_alive() {
+    local i=1 n=0
+    while [ $i -le "$PROXY_COUNT" ]; do
+        [ -n "$(slot_get PROXY $i)" ] && n=$((n + 1))
+        i=$((i + 1))
     done
-    start_gost "$new_proxy"
+    echo $n
+}
+
+update_ready() {
+    if [ "$(slots_alive)" -gt 0 ]; then mark_ready; else mark_unready; fi
+}
+
+# refill <start|failed|rotate> <槽位...>：给这些槽位换上新代理。
+# 一次提取所需个数；拿到的不够时，到期轮换的槽位先用着旧代理（15 秒后再试），坏掉的槽位置空。
+refill() {
+    local reason="$1"; shift
+    [ $# -eq 0 ] && return 0
+    local i old
+    for i in "$@"; do
+        old=$(slot_get PROXY "$i")
+        [ -n "$old" ] && { blacklist_add "$old"; delete_from_pool "$old"; }
+        [ "$reason" != rotate ] && slot_stop "$i"
+    done
+    update_ready
+    local got
+    got=$(get_proxies $#) || got=""
+    for i in "$@"; do
+        local p
+        p=$(echo "$got" | sed -n '1p')
+        got=$(echo "$got" | sed '1d')
+        if [ -n "$p" ]; then
+            slot_start "$i" "$p"
+            log "slot $i ($reason): $p"
+        elif [ "$reason" = rotate ] && [ -n "$(slot_get PROXY "$i")" ]; then
+            slot_set AT "$i" $(( $(slot_get AT "$i") + 15 ))
+        else
+            slot_stop "$i"
+        fi
+    done
+    sleep 1 # 等新 gost 监听
+    update_ready
+    log "active proxies: $(slots_alive)/${PROXY_COUNT}"
+}
+
+# check_slots：探测各槽位（刚换上 8 秒内的跳过），坏的和空的一起补。
+check_slots() {
+    local i=1 now bad=""
+    now=$(date +%s)
+    while [ $i -le "$PROXY_COUNT" ]; do
+        if [ -z "$(slot_get PROXY $i)" ]; then
+            bad="$bad $i"
+        elif [ $((now - $(slot_get AT $i))) -ge 8 ] && ! "$PROBE" "http://127.0.0.1:$((BASE_PORT + i - 1))"; then
+            log "slot $i health check FAILED: $(slot_get PROXY $i)"
+            bad="$bad $i"
+        fi
+        i=$((i + 1))
+    done
+    # shellcheck disable=SC2086
+    refill failed $bad
+}
+
+rotate_due() {
+    [ "$PROXY_MAX_AGE" -gt 0 ] || return 0
+    local i=1 now due=""
+    now=$(date +%s)
+    while [ $i -le "$PROXY_COUNT" ]; do
+        if [ -n "$(slot_get PROXY $i)" ] && [ $((now - $(slot_get AT $i))) -ge "$PROXY_MAX_AGE" ]; then
+            due="$due $i"
+        fi
+        i=$((i + 1))
+    done
+    # shellcheck disable=SC2086
+    refill rotate $due
+}
+
+start_front() {
+    local ips="" i=1
+    while [ $i -le "$PROXY_COUNT" ]; do
+        ips="${ips:+$ips,}127.0.0.1:$((BASE_PORT + i - 1))"
+        i=$((i + 1))
+    done
+    # 某个槽位连不上（正在换、已置空）时，前端 10 秒内不再选它
+    gost -L "http://:${PORT}" \
+        -F "http://127.0.0.1:${BASE_PORT}?ip=${ips}&strategy=round&max_fails=1&fail_timeout=10s" &
 }
 
 monitor() {
-    local fail_count=0
-    local tick=0
+    local tick=0 wait_s=30 next_fill=0
+    local interval_ticks=$((HEALTH_INTERVAL / 3))
+    [ "$interval_ticks" -lt 1 ] && interval_ticks=1
     while true; do
         sleep 3
         tick=$((tick + 1))
 
-        # 418 trigger from tiler (check every 3s)
+        # tiler 报告代理出错（每 3 秒看一次）：马上探测各槽位
         if [ -f "$SWITCH_TRIGGER" ]; then
             log "switch trigger from tiler: $(cat "$SWITCH_TRIGGER" 2>/dev/null)"
             rm -f "$SWITCH_TRIGGER"
-            # 刚换完代理时，旧 gost 上被中断的请求也会报错触发切换，这几秒内的通知忽略，免得把新代理换掉
-            if [ $(( $(date +%s) - STARTED_AT )) -lt 8 ]; then
-                log "ignored: proxy just switched"
-                continue
-            fi
-            switch_proxy || true
-            fail_count=0
+            check_slots || true
             tick=0
             continue
         fi
 
         # 短效代理到期前主动换
-        if [ "$PROXY_MAX_AGE" -gt 0 ] && [ $(( $(date +%s) - STARTED_AT )) -ge "$PROXY_MAX_AGE" ]; then
-            rotate_proxy || true
-            fail_count=0
-            tick=0
-            continue
-        fi
+        rotate_due || true
 
-        # periodic health check
-        local interval_ticks=$((HEALTH_INTERVAL / 3))
-        [ "$interval_ticks" -lt 1 ] && interval_ticks=1
         if [ $((tick % interval_ticks)) -eq 0 ]; then
-            if health_check; then
-                fail_count=0
-            else
-                fail_count=$((fail_count + 1))
-                log "health check FAILED ($fail_count)"
-                if [ "$fail_count" -ge 1 ]; then
-                    switch_proxy || true
-                    fail_count=0
+            # 全空时按 30 秒起、最长 5 分钟的间隔重试，避免空耗提取额度
+            if [ "$(slots_alive)" -eq 0 ]; then
+                [ "$(date +%s)" -lt "$next_fill" ] && continue
+                log "WARN: no proxy available, retrying"
+                check_slots || true
+                if [ "$(slots_alive)" -eq 0 ]; then
+                    next_fill=$(( $(date +%s) + wait_s ))
+                    log "WARN: still no proxy, pausing downloads, retry in ${wait_s}s"
+                    wait_s=$((wait_s * 2)); [ "$wait_s" -gt 300 ] && wait_s=300
+                else
+                    wait_s=30
                 fi
+                continue
             fi
+            check_slots || true
         fi
     done
 }
 
 # ── main ──
-log "config: timeout=${CONNECT_TIMEOUT}/${MAX_TIME}s, health=${HEALTH_INTERVAL}s, batch=${PRE_TEST_BATCH}, max_age=${PROXY_MAX_AGE}s"
+log "config: proxies=${PROXY_COUNT}, timeout=${CONNECT_TIMEOUT}/${MAX_TIME}s, health=${HEALTH_INTERVAL}s, batch=${PRE_TEST_BATCH}, max_age=${PROXY_MAX_AGE}s"
 log "test url: $TEST_URL"
 wait_for_pool || { log "proxy_pool not reachable, exiting"; exit 1; }
 
+start_front
 wait_s=30
+all=$(i=1; while [ $i -le "$PROXY_COUNT" ]; do printf '%s ' $i; i=$((i + 1)); done)
 while true; do
-    first=$(get_proxy) && break
+    # shellcheck disable=SC2086
+    refill start $all
+    [ "$(slots_alive)" -gt 0 ] && break
     log "no proxy available at startup, retry in ${wait_s}s..."
-    mark_unready
     sleep "$wait_s"
     wait_s=$((wait_s * 2)); [ "$wait_s" -gt 300 ] && wait_s=300
 done
-start_gost "$first"
 monitor
