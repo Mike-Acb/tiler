@@ -150,6 +150,32 @@ func TestProxyModes(t *testing.T) {
 		t.Fatalf("pool env 不对: %s", b)
 	}
 
+	if strings.Contains(string(b), "PROXY_AUTH") {
+		t.Fatalf("未配置 proxySecret 时不应设 PROXY_AUTH: %s", b)
+	}
+
+	// 提取链接 + 代理账号：账号从 Secret 取；描述里隐去 key
+	r.ProxySecret = "tiler-proxy-secret"
+	p, _ = ProxyOpt{Mode: "pool", URL: "https://share.proxy.qg.net/get?key=K123&num=1"}.resolve(l, r)
+	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
+	if !strings.Contains(string(b), `"PROXY_AUTH","valueFrom":{"secretKeyRef":{"key":"PROXY_AUTH","name":"tiler-proxy-secret","optional":true}}`) {
+		t.Fatalf("应从 Secret 取 PROXY_AUTH: %s", b)
+	}
+	if strings.Contains(p.describe(), "K123") {
+		t.Fatalf("描述泄露提取 key: %s", p.describe())
+	}
+	p, _ = ProxyOpt{Mode: "default"}.resolve(l, r)
+	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
+	if !strings.Contains(string(b), `"PROXY_AUTH"`) {
+		t.Fatalf("按图层默认也应带 PROXY_AUTH: %s", b)
+	}
+	p, _ = ProxyOpt{Mode: "upstream", URL: "socks5://10.0.0.1:1080"}.resolve(l, r)
+	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
+	if strings.Contains(string(b), "PROXY_AUTH") {
+		t.Fatalf("固定上游的账号写在地址里，不应再带 PROXY_AUTH: %s", b)
+	}
+	r.ProxySecret = ""
+
 	p, _ = ProxyOpt{Mode: "direct"}.resolve(l, r)
 	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
 	if strings.Contains(string(b), "HTTP_PROXY") {

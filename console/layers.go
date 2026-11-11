@@ -15,9 +15,11 @@ import (
 
 // Registry 描述控制台管理的图层，以及生成 Job 用到的集群资源名。
 type Registry struct {
-	Namespace        string `json:"namespace"`
-	Images           Images `json:"images"`
-	ProxyConfigMap   string `json:"proxyConfigMap"`
+	Namespace      string `json:"namespace"`
+	Images         Images `json:"images"`
+	ProxyConfigMap string `json:"proxyConfigMap"`
+	// ProxySecret 可选：代理账号（键 PROXY_AUTH，格式 用户名:密码），按图层默认和代理池模式下交给代理 sidecar
+	ProxySecret      string `json:"proxySecret,omitempty"`
 	GeojsonMountPath string `json:"geojsonMountPath"`
 
 	// ---- 存储与预览（环境变量优先，见 storage.go）----
@@ -329,8 +331,13 @@ func (p ProxyOpt) resolve(l *LayerEntry, r *Registry) (ProxyOpt, error) {
 // describe 给页面展示用，隐去代理地址里的账号密码。
 func (p ProxyOpt) describe() string {
 	shown := p.URL
-	if u, err := url.Parse(p.URL); err == nil && u.User != nil {
-		u.User = url.User("***")
+	if u, err := url.Parse(p.URL); err == nil {
+		if u.User != nil {
+			u.User = url.User("***")
+		}
+		if u.RawQuery != "" { // 提取链接的查询参数里有 key
+			u.RawQuery = "***"
+		}
 		shown = u.String()
 	}
 	switch p.Mode {
@@ -406,6 +413,11 @@ func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason, kind st
 					envFromCM("UPSTREAM_PROXY", r.ProxyConfigMap, "UPSTREAM_PROXY", true),
 					envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true),
 				}
+			}
+			// 固定上游的账号直接写在地址里；代理池 / 提取链接拿到的代理用 Secret 里的账号认证
+			if proxy.Mode != "upstream" && r.ProxySecret != "" {
+				proxyEnv = append(proxyEnv, map[string]any{"name": "PROXY_AUTH", "valueFrom": map[string]any{
+					"secretKeyRef": map[string]any{"name": r.ProxySecret, "key": "PROXY_AUTH", "optional": true}}})
 			}
 			initContainers = append(initContainers, map[string]any{
 				"name":            "proxy",

@@ -1020,8 +1020,8 @@ function renderProxyField() {
   wrap.hidden = mode !== "pool" && mode !== "upstream";
   if (mode === "pool") {
     $("#f-proxy-url-label").textContent = "代理池 API（留空用 tiler-proxy-config）";
-    input.placeholder = "http://proxy-pool:5010";
-    hint.textContent = "sidecar 从代理池批量取代理并测速，失败自动切换。";
+    input.placeholder = "http://proxy-pool:5010 或 https://…/get?key=…";
+    hint.textContent = "填代理池地址（jhao104/proxy_pool）或带 ? 的提取链接（如青果），sidecar 取代理、测试能否返回瓦片，失败自动切换；代理账号读 Secret 里的 PROXY_AUTH。";
   } else if (mode === "upstream") {
     $("#f-proxy-url-label").textContent = "上游代理地址";
     input.placeholder = "socks5://user:pass@10.0.0.1:1080";
