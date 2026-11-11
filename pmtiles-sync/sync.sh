@@ -47,13 +47,10 @@ process_dir() {
     fi
 
     echo "    Converting to MBTiles (format: $format)..."
-    mb-util --image_format="$format" --scheme=xyz "$tiledir" "$mbtiles_file"
+    # 并发读取瓦片（目录多在 NFS 上，逐张读太慢）；0 字节的 404 标记不写入，metadata.json 一并导入
+    "$SCRIPT_DIR/dir2mbtiles.py" "$tiledir" "$mbtiles_file" "$format"
 
-    # 0 字节文件是 tiler 写的 404 标记，目录里要保留它供增量下载跳过，只从 mbtiles 中剔除
-    echo "    Removing empty tiles (404 markers) from MBTiles..."
-    "$SCRIPT_DIR/drop-empty-tiles.sh" "$mbtiles_file"
-
-    # 目录里有 metadata.json 时 mb-util 已导入；没有（旧版 tiler 下载的）就用控制台传来的元数据补上
+    # 目录里有 metadata.json 时已导入；没有（旧版 tiler 下载的）就用控制台传来的元数据补上
     if [ ! -f "$tiledir/metadata.json" ] && [ -n "${TILE_METADATA:-}" ]; then
         echo "    No metadata.json, applying TILE_METADATA..."
         "$SCRIPT_DIR/apply-metadata.sh" "$mbtiles_file"

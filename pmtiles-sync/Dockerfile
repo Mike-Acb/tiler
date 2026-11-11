@@ -5,12 +5,10 @@ RUN CGO_ENABLED=0 go install github.com/minio/mc@v0.0.0-20251106162529-77f82e18b
 
 FROM python:3.11-slim
 
-RUN pip install --no-cache-dir mbutil
-
 COPY --from=go-builder /go/bin/go-pmtiles /usr/local/bin/pmtiles
 COPY --from=go-builder /go/bin/mc /usr/local/bin/mc
 
-COPY sync.sh detect-format.sh drop-empty-tiles.sh apply-metadata.sh /app/
-RUN chmod +x /app/sync.sh /app/detect-format.sh /app/drop-empty-tiles.sh /app/apply-metadata.sh
+COPY sync.sh detect-format.sh dir2mbtiles.py apply-metadata.sh /app/
+RUN chmod +x /app/sync.sh /app/detect-format.sh /app/dir2mbtiles.py /app/apply-metadata.sh
 
 ENTRYPOINT ["/app/sync.sh"]

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # apply-metadata.sh <mbtiles>：把环境变量 TILE_METADATA（JSON 对象）写进 mbtiles 的 metadata 表。
-# 旧版 tiler 下载的目录没有 metadata.json，mb-util 导出的 mbtiles 就没有名称、格式和范围，
+# 旧版 tiler 下载的目录没有 metadata.json，转出的 mbtiles 就没有名称、格式和范围，
 # pmtiles convert 打出来的文件也跟着缺；控制台的打包 Job 会按图层配置生成这份元数据传进来。
 mbtiles="${1:?mbtiles file is required}"
 
