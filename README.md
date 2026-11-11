@@ -17,8 +17,6 @@ A well-polished tile downloader
 `[[lrs]]` 区域、在地图上圈选新区域并派发下载 Job（可逐次指定代理），以及实时查看 Job 日志。
 下载与打包默认拆成两步：下载完成后图层标记「待打包」，确认下载结果后再点「打包上传」，
 把整个目录打成 pmtiles 覆盖 MinIO 上的同名文件；派发时勾选「下载完成后自动打包」则一步完成。
-部署清单见 `deploy/console.yaml`（NodePort 30880），
-图层清单在其中的 `tiler-console-layers` ConfigMap；写操作口令放在 `tiler-console-secret`。
 
 本地调试：`kubectl proxy --port=18001` 后以
 `KUBE_API=http://127.0.0.1:18001 DRY_RUN=1 LAYERS_FILE=<layers.json> MINIO_*=... go run .`

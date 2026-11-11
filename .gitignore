@@ -5,6 +5,7 @@ tiler
 # Config & Deploy
 conf.toml
 deploy/
+k8s/
 
 # Output
 output/
