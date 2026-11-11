@@ -288,6 +288,9 @@ func fetchTile(tileURL string) ([]byte, error) {
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if usingProxy() { // 换代理时旧连接被掐断（unexpected EOF），重试即可，不用再通知切换
+			return nil, fmt.Errorf("%w: 读取响应失败: %v", errProxy, err)
+		}
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 	if len(body) == 0 {

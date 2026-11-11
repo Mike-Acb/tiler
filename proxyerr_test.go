@@ -35,3 +35,19 @@ func TestIsProxyStatus(t *testing.T) {
 		}
 	}
 }
+
+// 换代理时旧连接被掐断，响应读到一半 EOF，也要算代理错误以便重试。
+func TestFetchTileProxyBodyCut(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("partial"))
+	}))
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	proxySwitchPath = filepath.Join(t.TempDir(), "switch")
+
+	if _, err := fetchTile("http://tiles.invalid/1/0/0.png"); !errors.Is(err, errProxy) {
+		t.Fatalf("err = %v, want errProxy", err)
+	}
+}
