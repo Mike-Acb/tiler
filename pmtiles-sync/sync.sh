@@ -44,6 +44,10 @@ process_dir() {
     echo "    Converting to MBTiles (format: $format)..."
     mb-util --image_format="$format" --scheme=xyz "$tiledir" "$mbtiles_file"
 
+    # 0 字节文件是 tiler 写的 404 标记，目录里要保留它供增量下载跳过，只从 mbtiles 中剔除
+    echo "    Removing empty tiles (404 markers) from MBTiles..."
+    "$SCRIPT_DIR/drop-empty-tiles.sh" "$mbtiles_file"
+
     echo "    Converting to PMTiles..."
     pmtiles convert "$mbtiles_file" "$pmtiles_file"
 

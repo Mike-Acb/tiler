@@ -13,7 +13,7 @@ COPY --from=pmtiles-builder /go/bin/go-pmtiles /usr/local/bin/pmtiles
 RUN curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
     -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc
 
-COPY sync.sh detect-format.sh /app/
-RUN chmod +x /app/sync.sh /app/detect-format.sh
+COPY sync.sh detect-format.sh drop-empty-tiles.sh /app/
+RUN chmod +x /app/sync.sh /app/detect-format.sh /app/drop-empty-tiles.sh
 
 ENTRYPOINT ["/app/sync.sh"]
