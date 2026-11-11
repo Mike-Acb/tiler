@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 //go:embed web
@@ -30,18 +29,22 @@ var webFS embed.FS
 type Server struct {
 	reg      *Registry
 	kube     *Kube
-	minio    *minio.Client
-	bucket   string
+	store    *Storage
 	password string
 	dispatch sync.Mutex // 单副本内串行化派发，避免同一图层并发改 ConfigMap
 
 	keyMu    sync.Mutex
-	keyCache map[string]cachedKey // 图层 id -> pmtiles 对象 key，避免每个 Range 请求都查 ConfigMap
+	keyCache map[string]cachedKey // 图层 id -> 目录名 / 格式 / pmtiles key，避免每个瓦片请求都查 ConfigMap
+
+	metaMu    sync.Mutex
+	metaCache map[string]cachedMeta // pmtiles 对象 key -> 文件头/metadata（按 ETag 失效）
 }
 
 type cachedKey struct {
-	key string
-	at  time.Time
+	key      string // MinIO 对象 key
+	tileName string // 下载目录名（tm.name）
+	format   string // tm.format，下载目录里的文件扩展名
+	at       time.Time
 }
 
 func main() {
@@ -54,11 +57,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	mc, bucket, err := newMinio()
+	store, err := loadStorage(reg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &Server{reg: reg, kube: kube, minio: mc, bucket: bucket, password: os.Getenv("CONSOLE_PASSWORD"), keyCache: map[string]cachedKey{}}
+	store.logSummary()
+	s := &Server{reg: reg, kube: kube, store: store, password: os.Getenv("CONSOLE_PASSWORD"), keyCache: map[string]cachedKey{}, metaCache: map[string]cachedMeta{}}
 	if s.password == "" {
 		log.Print("CONSOLE_PASSWORD 未设置：写操作（派发、删除 Job）全部禁用")
 	}
@@ -80,6 +84,8 @@ func main() {
 	mux.HandleFunc("DELETE /api/jobs/{name}", s.auth(s.handleDeleteJob))
 	mux.HandleFunc("GET /pmtiles/{file}", s.handlePMTiles)
 	mux.HandleFunc("HEAD /pmtiles/{file}", s.handlePMTiles)
+	mux.HandleFunc("GET /tiles/output/{id}/{z}/{x}/{y}", s.handleOutputTile)
+	mux.HandleFunc("GET "+tileServerRoute+"/{path...}", s.handleTileServer)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("GET /", http.FileServer(http.FS(sub)))
@@ -94,22 +100,6 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
-}
-
-func newMinio() (*minio.Client, string, error) {
-	ep := os.Getenv("MINIO_ENDPOINT")
-	if ep == "" {
-		return nil, "", errors.New("MINIO_ENDPOINT 未设置")
-	}
-	u, err := url.Parse(ep)
-	if err != nil || u.Host == "" {
-		return nil, "", fmt.Errorf("MINIO_ENDPOINT 无效: %q", ep)
-	}
-	mc, err := minio.New(u.Host, &minio.Options{
-		Creds:  credentials.NewStaticV4(os.Getenv("MINIO_ACCESS_KEY"), os.Getenv("MINIO_SECRET_KEY"), ""),
-		Secure: u.Scheme == "https",
-	})
-	return mc, envOr("MINIO_BUCKET", "open"), err
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -157,6 +147,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"writable":  s.password != "",
 		"dryRun":    s.kube.dryRun,
 		"proxy":     s.reg.Images.Proxy != "",
+		"storage":   s.store,
 	})
 }
 
@@ -164,19 +155,34 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 
 type layerState struct {
 	LayerEntry
-	TileName    string       `json:"tileName,omitempty"`
-	Format      string       `json:"format,omitempty"`
-	Min         int          `json:"min"`
-	Max         int          `json:"max"`
-	LrsCount    int          `json:"lrsCount"`
-	PMTilesKey  string       `json:"pmtilesKey,omitempty"`
-	PMTiles     *objInfo     `json:"pmtiles,omitempty"`
-	LastJob     *jobBrief    `json:"lastJob,omitempty"`
-	PendingPack *pendingPack `json:"pendingPack,omitempty"`
-	SharedWith  []string     `json:"sharedWith,omitempty"`
-	Error       string       `json:"error,omitempty"`
-	conf        *TilerConf   `json:"-"`
-	raw         string       `json:"-"`
+	TileName string `json:"tileName,omitempty"` // 输出目录（ConfigMap tm.name），派发任务以它为准
+	// 展示用：pmtiles 优先，缺失时用 ConfigMap 兜底；*From 标明来源（pmtiles / configmap）
+	Name       string   `json:"name,omitempty"`
+	NameFrom   string   `json:"nameFrom,omitempty"`
+	Format     string   `json:"format,omitempty"`
+	FormatFrom string   `json:"formatFrom,omitempty"`
+	Min        int      `json:"min"`
+	Max        int      `json:"max"`
+	ZoomFrom   string   `json:"zoomFrom,omitempty"`
+	ConfMin    int      `json:"confMin"` // ConfigMap 里的 tm.min / tm.max，派发时用
+	ConfMax    int      `json:"confMax"`
+	Missing    []string `json:"missing,omitempty"`  // pmtiles 缺失、已用 ConfigMap 兜底的项
+	Mismatch   []string `json:"mismatch,omitempty"` // pmtiles 与 ConfigMap 不一致的项
+	Meta       *PMMeta  `json:"meta,omitempty"`
+	ConfFormat string   `json:"confFormat,omitempty"` // tm.format：下载目录里的文件扩展名
+	// 各预览来源的可用性与地址
+	Output         bool         `json:"output"`                   // 下载目录里已有该图层目录（预览 A）
+	PMTilesURL     string       `json:"pmtilesUrl,omitempty"`     // 预览 B：pmtiles.js 读取地址
+	TileServerPath string       `json:"tileServerPath,omitempty"` // 预览 C：go-pmtiles serve 的瓦片集名
+	LrsCount       int          `json:"lrsCount"`
+	PMTilesKey     string       `json:"pmtilesKey,omitempty"`
+	PMTiles        *objInfo     `json:"pmtiles,omitempty"`
+	LastJob        *jobBrief    `json:"lastJob,omitempty"`
+	PendingPack    *pendingPack `json:"pendingPack,omitempty"`
+	SharedWith     []string     `json:"sharedWith,omitempty"`
+	Error          string       `json:"error,omitempty"`
+	conf           *TilerConf   `json:"-"`
+	raw            string       `json:"-"`
 }
 
 // pendingPack 表示目录里有比当前 pmtiles 更新的下载结果，等待人工确认打包。
@@ -204,14 +210,33 @@ func (s *Server) loadLayer(ctx context.Context, l *LayerEntry, withObject bool) 
 		return st
 	}
 	st.conf = conf
-	st.TileName, st.Format = conf.TM.Name, conf.TM.Format
-	st.Min, st.Max, st.LrsCount = conf.TM.Min, conf.TM.Max, len(conf.Lrs)
+	st.TileName, st.LrsCount = conf.TM.Name, len(conf.Lrs)
+	st.ConfMin, st.ConfMax = conf.TM.Min, conf.TM.Max
+	st.ConfFormat = conf.TM.Format
 	st.PMTilesKey = pmtilesKey(l.MinioPath, conf.TM.Name)
-	if withObject {
-		if info, err := s.minio.StatObject(ctx, s.bucket, st.PMTilesKey, minio.StatObjectOptions{}); err == nil {
-			st.PMTiles = &objInfo{Size: info.Size, Modified: info.LastModified}
+	if s.store.MinioReady {
+		// 预览 B：配置了公开地址就让浏览器直连，否则经控制台 /pmtiles/ 中转
+		if s.store.PMTilesPublicURL.Value != "" {
+			st.PMTilesURL = s.store.PMTilesPublicURL.Value + "/" + st.PMTilesKey
+		} else {
+			st.PMTilesURL = "/pmtiles/" + url.PathEscape(l.ID) + ".pmtiles"
 		}
 	}
+	if s.store.tileProxy != nil {
+		if p, err := tileServerPath(l.MinioPath, s.store.TileServerPrefix.Value, conf.TM.Name); err == nil {
+			st.TileServerPath = p
+		}
+	}
+	if withObject {
+		st.Output = s.outputExists(conf.TM.Name)
+		if s.store.MinioReady {
+			if info, err := s.store.minio.StatObject(ctx, s.store.bucket, st.PMTilesKey, minio.StatObjectOptions{}); err == nil {
+				st.PMTiles = &objInfo{Size: info.Size, Modified: info.LastModified}
+				st.Meta = s.readPMMeta(ctx, st.PMTilesKey, info.ETag)
+			}
+		}
+	}
+	resolveInfo(st)
 	return st
 }
 
@@ -259,7 +284,9 @@ func (s *Server) handleLayers(w http.ResponseWriter, r *http.Request) {
 				b := briefJob(j)
 				st.LastJob = &b
 			}
-			st.PendingPack = pendingFor(st, jobs)
+			if s.store.Upload { // 没有上传目标就谈不上「待打包」
+				st.PendingPack = pendingFor(st, jobs)
+			}
 		}
 	}
 	writeJSON(w, 200, layers)
@@ -388,6 +415,10 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	if req.AutoPack && !s.store.Upload {
+		writeErr(w, 400, errors.New(s.store.UploadReason))
+		return
+	}
 
 	s.dispatch.Lock()
 	defer s.dispatch.Unlock()
@@ -487,6 +518,10 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, err)
 		return
 	}
+	if req.AutoPack && !s.store.Upload {
+		writeErr(w, 400, errors.New(s.store.UploadReason))
+		return
+	}
 	kind := downloadKind(req.AutoPack)
 	jn := jobName(l.ID, kind, time.Now())
 	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, "按当前配置重新下载", kind, proxy)); err != nil {
@@ -509,6 +544,10 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request) {
 	l, ok := s.reg.layer(r.PathValue("id"))
 	if !ok {
 		writeErr(w, 404, errors.New("图层不存在"))
+		return
+	}
+	if !s.store.Upload {
+		writeErr(w, 400, errors.New(s.store.UploadReason))
 		return
 	}
 	s.dispatch.Lock()
@@ -815,12 +854,17 @@ func (s *Server) handlePMTiles(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	key, err := s.pmtilesObjectKey(r.Context(), l)
+	c, err := s.layerKeys(r.Context(), l)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	obj, err := s.minio.GetObject(r.Context(), s.bucket, key, minio.GetObjectOptions{})
+	if !s.store.MinioReady {
+		http.Error(w, "未配置 MinIO", http.StatusNotFound)
+		return
+	}
+	key := c.key
+	obj, err := s.store.minio.GetObject(r.Context(), s.store.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -841,19 +885,20 @@ func (s *Server) handlePMTiles(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", info.LastModified, obj)
 }
 
-func (s *Server) pmtilesObjectKey(ctx context.Context, l *LayerEntry) (string, error) {
+func (s *Server) layerKeys(ctx context.Context, l *LayerEntry) (cachedKey, error) {
 	s.keyMu.Lock()
 	c, ok := s.keyCache[l.ID]
 	s.keyMu.Unlock()
 	if ok && time.Since(c.at) < 30*time.Second {
-		return c.key, nil
+		return c, nil
 	}
 	st := s.loadLayer(ctx, l, false)
 	if st.conf == nil {
-		return "", errors.New(st.Error)
+		return cachedKey{}, errors.New(st.Error)
 	}
+	c = cachedKey{key: st.PMTilesKey, tileName: st.TileName, format: st.conf.TM.Format, at: time.Now()}
 	s.keyMu.Lock()
-	s.keyCache[l.ID] = cachedKey{key: st.PMTilesKey, at: time.Now()}
+	s.keyCache[l.ID] = c
 	s.keyMu.Unlock()
-	return st.PMTilesKey, nil
+	return c, nil
 }

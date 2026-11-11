@@ -11,6 +11,9 @@ const KIND_TEXT = { download: "下载", pack: "打包", all: "下载+打包" };
 const store = {
   get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch { /* 隐私模式下忽略 */ } },
+  // 预览来源这类偏好跨会话保留
+  getLocal(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  setLocal(k, v) { try { localStorage.setItem(k, v); } catch { /* 忽略 */ } },
 };
 
 const state = {
@@ -20,7 +23,8 @@ const state = {
   selected: null,       // layer id
   detail: null,         // /api/layers/{id}
   visible: new Set(),   // 地图上显示的图层 id
-  headers: new Map(),   // id -> pmtiles header
+  src: store.getLocal("tc-src") || "output", // 预览来源：output / pmtiles / tileserver
+  loaded: new Map(),    // id -> 已加载图层的「来源:数据版本」，变了就重建
   lrsHidden: new Set(),
   tab: "regions",
   draft: null,          // 待派发区域 FeatureCollection
@@ -187,27 +191,80 @@ map.on("move", () => updateHud());
 map.on("mousemove", updateHud);
 
 const tileSourceId = (id) => "tiles-" + id;
-const absUrl = (id) => new URL("/pmtiles/" + encodeURIComponent(id) + ".pmtiles", location.href).href;
+const absUrl = (u) => new URL(u, location.href).href;
+// MapLibre 的瓦片模板要保留 {z}/{x}/{y}，new URL 会把花括号转义
+const tileTpl = (path) => absUrl(path).replace(/%7B/g, "{").replace(/%7D/g, "}");
+
+// ---- 预览来源 ----
+// A 下载目录：控制台读 PVC 里的 z/x/y 文件，能看到还没打包的下载结果
+// B pmtiles.js：浏览器直读 pmtiles（配置了公开地址就直连 MinIO，否则经控制台中转）
+// C 瓦片服务：经控制台反向代理读 go-pmtiles serve 的 z/x/y
+const SOURCES = [
+  { id: "output", key: "A", name: "下载目录" },
+  { id: "pmtiles", key: "B", name: "pmtiles.js 直读" },
+  { id: "tileserver", key: "C", name: "瓦片服务" },
+];
+
+function sourceReady(src) {
+  const sto = state.info.storage || {};
+  if (src === "output") return true;
+  if (src === "pmtiles") return !!sto.minioReady;
+  if (src === "tileserver") return !!(sto.tileServer && sto.tileServer.value);
+  return false;
+}
+
+// 某图层在某来源下有没有数据；返回不可用原因，可用时返回空串
+function unavailableReason(layer, src = state.src) {
+  if (!sourceReady(src)) return "未配置该预览来源";
+  if (layer.format === "pbf" || layer.confFormat === "pbf") return "矢量瓦片（pbf）暂不支持预览";
+  if (src === "output") return layer.output ? "" : "下载目录里还没有该图层";
+  if (src === "pmtiles") return layer.pmtiles ? "" : "MinIO 上还没有 pmtiles（尚未打包）";
+  if (src === "tileserver") {
+    if (!layer.tileServerPath) return "minioPath 不在瓦片服务前缀下";
+    if (state.info.storage.minioReady && !layer.pmtiles) return "MinIO 上还没有 pmtiles（尚未打包）";
+    return "";
+  }
+  return "未知来源";
+}
+
+// 数据版本：变了就重新加载图层，并用 v= 绕开浏览器缓存
+function layerVersion(layer, src = state.src) {
+  if (src === "output") {
+    const j = layer.lastJob;
+    return j && j.completed ? new Date(j.completed).getTime() : 0;
+  }
+  return layer.pmtiles ? new Date(layer.pmtiles.modified).getTime() : 0;
+}
+
+function sourceSpec(layer) {
+  const v = layerVersion(layer);
+  const id = encodeURIComponent(layer.id);
+  if (state.src === "output") {
+    return {
+      type: "raster", tileSize: 256, minzoom: 0, maxzoom: layer.confMax,
+      tiles: [tileTpl(`/tiles/output/${id}/{z}/{x}/{y}?v=${v}`)],
+      attribution: layer.title + " · 下载目录",
+    };
+  }
+  if (state.src === "pmtiles") {
+    return { type: "raster", tileSize: 256, url: "pmtiles://" + absUrl(layer.pmtilesUrl), attribution: layer.title + " · pmtiles" };
+  }
+  return {
+    type: "raster", tileSize: 256, minzoom: 0, maxzoom: layer.max,
+    tiles: [tileTpl(`/tile-server/${layer.tileServerPath}/{z}/{x}/{y}.${layer.confFormat}?v=${v}`)],
+    attribution: layer.title + " · 瓦片服务",
+  };
+}
 
 async function ensureTileLayer(layer) {
   await mapReady;
   const sid = tileSourceId(layer.id);
   if (map.getSource(sid)) return;
-  if (layer.format === "pbf") { toast("矢量瓦片（pbf）暂不支持预览", true); return; }
-  let header = state.headers.get(layer.id);
-  if (!header) {
-    const p = new pmtiles.PMTiles(absUrl(layer.id));
-    protocol.add(p);
-    header = await p.getHeader();
-    state.headers.set(layer.id, header);
-  }
-  map.addSource(sid, {
-    type: "raster",
-    url: "pmtiles://" + absUrl(layer.id),
-    tileSize: 256,
-    attribution: layer.title,
-  });
+  const why = unavailableReason(layer);
+  if (why) throw new Error(why);
+  map.addSource(sid, sourceSpec(layer));
   map.addLayer({ id: sid, type: "raster", source: sid, paint: { "raster-fade-duration": 120 } }, firstOverlayId());
+  state.loaded.set(layer.id, state.src + ":" + layerVersion(layer));
   reorderTileLayers();
 }
 
@@ -215,6 +272,7 @@ function removeTileLayer(id) {
   const sid = tileSourceId(id);
   if (map.getLayer(sid)) map.removeLayer(sid);
   if (map.getSource(sid)) map.removeSource(sid);
+  state.loaded.delete(id);
 }
 
 // 栅格层按清单顺序叠放：清单里靠后的（通常是注记）在上
@@ -230,12 +288,35 @@ function firstOverlayId() {
   return ids.find((id) => id.startsWith("lrs-") || id.startsWith("draft-"));
 }
 
+// 切换来源或数据更新后，按当前来源重建已打开的图层
+function refreshTileLayers(force = false) {
+  for (const id of state.visible) {
+    const layer = state.layers.find((l) => l.id === id);
+    if (!layer) continue;
+    const want = state.src + ":" + layerVersion(layer);
+    if (!force && state.loaded.get(id) === want) continue;
+    removeTileLayer(id);
+    if (!unavailableReason(layer)) ensureTileLayer(layer).catch((e) => toast(`${layer.title}：${e.message}`, true));
+  }
+}
+
+function setSource(src) {
+  if (src === state.src || !sourceReady(src)) return;
+  state.src = src;
+  store.setLocal("tc-src", src);
+  refreshTileLayers(true);
+  const missing = [...state.visible].map((id) => state.layers.find((l) => l.id === id)).filter((l) => l && unavailableReason(l));
+  if (missing.length) toast(`${missing.map((l) => l.title).join("、")} 在「${SOURCES.find((x) => x.id === src).name}」下没有数据`);
+  renderSourceSwitch();
+  renderLayers();
+}
+
 async function toggleVisible(id, on) {
   const layer = state.layers.find((l) => l.id === id);
   if (!layer) return;
   if (on) {
     state.visible.add(id);
-    try { await ensureTileLayer(layer); } catch (e) { state.visible.delete(id); toast("加载 pmtiles 失败：" + e.message, true); }
+    try { await ensureTileLayer(layer); } catch (e) { state.visible.delete(id); toast(`${layer.title}：${e.message}`, true); }
   } else {
     state.visible.delete(id);
     removeTileLayer(id);
@@ -433,8 +514,47 @@ async function loadInfo() {
   } catch (e) { toast("连接服务失败：" + e.message, true); }
   $("#ns-chip").textContent = "命名空间 " + (state.info.namespace || "?");
   $("#dry-chip").hidden = !state.info.dryRun;
+  const sto = state.info.storage || {};
+  $("#output-chip").textContent = "下载目录 " + ((sto.outputDir && sto.outputDir.value) || "?");
+  const mc = $("#minio-chip");
+  mc.classList.toggle("off", !sto.upload);
+  mc.textContent = sto.upload ? `上传 MinIO · ${sto.minioBucket.value}` : sto.minioReady ? "MinIO 只读（不能打包）" : "未配置 MinIO · 只下载";
+  mc.title = sto.uploadReason || "打包后的 pmtiles 上传到 MinIO";
+  if (!sourceReady(state.src)) state.src = "output";
   if (!state.info.writable) setToken(null);
   renderLock();
+  renderSourceSwitch();
+}
+
+// 地图左上角的预览来源切换，下面一行说明实际读的是哪里
+function renderSourceSwitch() {
+  const sto = state.info.storage || {};
+  const seg = $("#src-seg");
+  const sub = {
+    output: "读 PVC 里的 z/x/y 文件",
+    pmtiles: !sto.minioReady ? "未配置 MinIO" : sto.pmtilesPublicUrl && sto.pmtilesPublicUrl.value ? "浏览器直连 MinIO" : "经控制台中转 MinIO",
+    tileserver: sto.tileServer && sto.tileServer.value ? "go-pmtiles serve · 反向代理" : "未配置 TILE_SERVER_URL",
+  };
+  seg.innerHTML = SOURCES.map((x) => `
+    <button type="button" role="radio" aria-checked="${x.id === state.src}" class="${x.id === state.src ? "on" : ""}" data-src="${x.id}" ${sourceReady(x.id) ? "" : "disabled"}>
+      <b>${x.key} ${x.name}</b><small>${sub[x.id]}</small>
+    </button>`).join("");
+  seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => setSource(b.dataset.src)));
+
+  const l = currentLayer() || state.layers.find((x) => state.visible.has(x.id));
+  const name = l ? l.tileName : "<目录>";
+  const lid = l ? l.id : "<图层>";
+  const urlEl = $("#src-url");
+  if (state.src === "output") {
+    urlEl.innerHTML = `<span class="k">浏览器请求</span> /tiles/output/${esc(lid)}/{z}/{x}/{y}<br><span class="arrow">→</span> <span class="k">控制台读</span> ${esc(sto.outputDir ? sto.outputDir.value : "")}/${esc(name)}/{z}/{x}/{y}.${esc(l ? l.confFormat : "fmt")}`;
+  } else if (state.src === "pmtiles") {
+    urlEl.innerHTML = l && l.pmtilesUrl && /^https?:/.test(l.pmtilesUrl)
+      ? `<span class="k">浏览器 pmtiles.js 直读</span> ${esc(l.pmtilesUrl)}`
+      : `<span class="k">浏览器 pmtiles.js 读</span> /pmtiles/${esc(lid)}.pmtiles<br><span class="arrow">→</span> <span class="k">控制台转发 Range 请求到 MinIO</span> ${esc(sto.minioBucket ? sto.minioBucket.value : "")}/${esc(l ? l.pmtilesKey : "")}`;
+  } else {
+    const path = l && l.tileServerPath ? l.tileServerPath : "<瓦片集>";
+    urlEl.innerHTML = `<span class="k">浏览器请求</span> /tile-server/${esc(path)}/{z}/{x}/{y}.${esc(l ? l.confFormat : "fmt")}<br><span class="arrow">→</span> <span class="k">反向代理到</span> ${esc(sto.tileServer ? sto.tileServer.value : "")}/${esc(path)}/…`;
+  }
 }
 
 async function loadLayers() {
@@ -444,6 +564,8 @@ async function loadLayers() {
     $("#layer-list").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     return;
   }
+  // 下载完成 / 打包上传后数据版本变了：已显示的图层按当前来源重建
+  refreshTileLayers();
   renderLayers();
   if (state.selected) { renderPanelHead(); renderDispatchState(); }
 }
@@ -459,7 +581,7 @@ async function selectLayer(id) {
   renderLayers();
   renderPanel();
   const layer = state.layers.find((l) => l.id === id);
-  if (layer && layer.pmtiles && !state.visible.has(id)) toggleVisible(id, true);
+  if (layer && !unavailableReason(layer) && !state.visible.has(id)) toggleVisible(id, true);
   try {
     const detail = await api("/api/layers/" + encodeURIComponent(id));
     if (state.selected !== id) return;
@@ -504,16 +626,21 @@ function renderLayers() {
       const side = running || (job && !l.pendingPack)
         ? `<span class="dot ${job.phase}"></span>${PHASE_TEXT[job.phase] || job.phase}`
         : l.pendingPack ? '<span class="tag warn">待打包</span>' : "";
-      const sub = l.tileName ? `${l.tileName} · ${l.format} · z${l.min}-${l.max}` : l.configMap;
+      const sub = l.tileName ? `${l.name || l.tileName} · ${l.format} · z${l.min}-${l.max}` : l.configMap;
+      const warnN = (l.missing || []).length + (l.mismatch || []).length;
+      const why = unavailableReason(l);
+      // 各来源是否有数据：只列出已配置的来源
+      const avail = SOURCES.filter((x) => sourceReady(x.id)).map((x) =>
+        `<span class="${unavailableReason(l, x.id) ? "" : "on"}" title="${x.key} ${x.name}：${esc(unavailableReason(l, x.id) || "有数据")}">${x.key}</span>`).join("");
       el.innerHTML = `
-        <button class="eye ${state.visible.has(l.id) ? "on" : ""}" type="button" title="${l.pmtiles ? "在地图上显示" : "pmtiles 尚未生成"}" ${l.pmtiles ? "" : "disabled"}>
+        <button class="eye ${state.visible.has(l.id) ? "on" : ""}" type="button" title="${esc(why || "在地图上显示")}" ${why ? "disabled" : ""}>
           <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5C6 5 2 12 2 12s4 7 10 7 10-7 10-7-4-7-10-7Zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Z"/></svg>
         </button>
         <div style="min-width:0">
           <div class="layer-name">${esc(l.title || l.id)}</div>
-          <div class="layer-sub">${esc(sub)}</div>
+          <div class="layer-sub">${warnN ? `<span class="meta-warn" title="${esc([...(l.missing || []).map((m) => "pmtiles 缺少：" + m), ...(l.mismatch || [])].join("\n"))}">!</span>` : ""}${esc(sub)}</div>
         </div>
-        <div class="layer-side">${side}<div>${l.pmtiles ? fmtSize(l.pmtiles.size) : "无 pmtiles"}</div></div>
+        <div class="layer-side">${side}<div>${l.pmtiles ? fmtSize(l.pmtiles.size) : state.info.storage && state.info.storage.minioReady ? "未打包" : ""}</div><div class="avail">${avail}</div></div>
         ${l.error ? `<div class="layer-err">${esc(l.error)}</div>` : ""}`;
       el.addEventListener("click", () => selectLayer(l.id));
       $(".eye", el).addEventListener("click", (e) => { e.stopPropagation(); toggleVisible(l.id, !state.visible.has(l.id)); });
@@ -524,6 +651,7 @@ function renderLayers() {
 }
 
 // ============ 渲染：右侧面板 ============
+const fromTag = (from) => (from === "configmap" ? '<span class="from cm" title="pmtiles 里没有，按 ConfigMap 显示">配置</span>' : from === "pmtiles" ? '<span class="from pm" title="读自 pmtiles 文件头 / metadata">pmtiles</span>' : "");
 function currentLayer() { return state.layers.find((l) => l.id === state.selected); }
 
 function renderPanel() {
@@ -536,6 +664,7 @@ function renderPanel() {
     <nav class="tabs" role="tablist">
       <button class="tab ${state.tab === "regions" ? "active" : ""}" data-tab="regions" type="button">区域与派发</button>
       <button class="tab ${state.tab === "jobs" ? "active" : ""}" data-tab="jobs" type="button">任务</button>
+      <button class="tab ${state.tab === "storage" ? "active" : ""}" data-tab="storage" type="button">存储</button>
       <button class="tab ${state.tab === "conf" ? "active" : ""}" data-tab="conf" type="button">配置</button>
     </nav>
     <div id="tab-body"></div>`;
@@ -547,7 +676,50 @@ function renderPanel() {
   renderPanelHead();
   if (state.tab === "regions") renderRegions();
   else if (state.tab === "jobs") renderJobs();
+  else if (state.tab === "storage") renderStorage();
   else renderConf();
+  renderSourceSwitch();
+}
+
+const FROM_TEXT = { env: "环境变量", json: "layers.json", default: "默认值", none: "未配置" };
+function cfgRow(name, setting, display) {
+  const st = setting || { from: "none" };
+  const v = display !== undefined ? display : st.value;
+  return `<tr><td>${esc(name)}</td><td>${v ? `<code>${esc(v)}</code>` : '<span class="muted">—</span>'}<span class="src-tag ${st.from}">${FROM_TEXT[st.from] || st.from}</span></td></tr>`;
+}
+
+function renderStorage() {
+  const sto = state.info.storage || {};
+  const l = currentLayer();
+  $("#tab-body").innerHTML = `
+    <div class="section"><h3>下载存储（主）</h3>
+      <table class="cfg">
+        ${cfgRow("OUTPUT_DIR", sto.outputDir)}
+        <tr><td>PVC</td><td><code>${esc(sto.outputPVC || "")}</code><span class="src-tag json">layers.json</span></td></tr>
+        ${l ? `<tr><td>本图层目录</td><td><code>${esc(l.tileName)}</code> ${l.output ? "" : '<span class="muted">（还没有下载过）</span>'}</td></tr>` : ""}
+      </table>
+      <p class="hint">下载 Job 写入这里；控制台只读挂载，预览 A 直接读这里的 z/x/y 文件。</p>
+    </div>
+    <div class="section"><h3>上传存储（可选）· MinIO</h3>
+      <table class="cfg">
+        ${cfgRow("MINIO_ENDPOINT", sto.minioEndpoint)}
+        ${sto.minioReady ? cfgRow("MINIO_BUCKET", sto.minioBucket) + cfgRow("MINIO_ACCESS_KEY", sto.minioAccessKey) : ""}
+        <tr><td>打包上传</td><td>${sto.upload ? '<code>可用</code>' : `<span class="muted">${esc(sto.uploadReason || "不可用")}</span>`}</td></tr>
+        ${l && sto.minioReady ? `<tr><td>本图层对象</td><td><code>${esc(l.pmtilesKey)}</code> ${l.pmtiles ? `<span class="muted">${fmtSize(l.pmtiles.size)} · ${fmtTime(l.pmtiles.modified)}</span>` : '<span class="muted">（尚未打包）</span>'}</td></tr>` : ""}
+      </table>
+      <p class="hint">${sto.upload ? "打包后的 pmtiles 上传到这里；预览 B 读它。" : "没配置时只下载，不显示打包上传和预览 B。"}</p>
+    </div>
+    <div class="section"><h3>预览来源</h3>
+      <table class="cfg">
+        <tr><td>A 下载目录</td><td><code>随下载存储启用</code></td></tr>
+        ${cfgRow("B PMTILES_PUBLIC_URL", sto.pmtilesPublicUrl)}
+        ${sto.minioReady && !(sto.pmtilesPublicUrl && sto.pmtilesPublicUrl.value) ? '<tr><td></td><td class="muted">没配公开地址：B 经控制台 /pmtiles/ 中转</td></tr>' : ""}
+        ${cfgRow("C TILE_SERVER_URL", sto.tileServer)}
+        ${sto.tileServer && sto.tileServer.value ? cfgRow("C TILE_SERVER_PREFIX", sto.tileServerPrefix) : ""}
+        ${l && l.tileServerPath ? `<tr><td>本图层瓦片集</td><td><code>${esc(l.tileServerPath)}</code></td></tr>` : ""}
+      </table>
+      <p class="hint">取值顺序：环境变量 → layers.json → 默认值，标签表示当前生效值的来源。</p>
+    </div>`;
 }
 
 function renderPanelHead() {
@@ -557,17 +729,25 @@ function renderPanelHead() {
   head.innerHTML = `
     <h2>${esc(l.title || l.id)}</h2>
     <div class="kv">
-      <span>目录 <code>${esc(l.tileName || "?")}</code></span>
-      <span>层级 <code>${l.min}-${l.max}</code></span>
-      <span>格式 <code>${esc(l.format || "?")}</code></span>
-      <span>区域 <code>${l.lrsCount}</code></span>
+      <span>名称 <code>${esc(l.name || "?")}</code>${fromTag(l.nameFrom)}</span>
+      <span>格式 <code>${esc(l.format || "?")}</code>${fromTag(l.formatFrom)}</span>
+      <span>层级 <code>${l.min}-${l.max}</code>${fromTag(l.zoomFrom)}</span>
     </div>
     <div class="kv" style="margin-top:4px">
-      <span>pmtiles <code>${l.pmtiles ? fmtSize(l.pmtiles.size) + " · " + fmtTime(l.pmtiles.modified) : "未生成"}</code></span>
+      <span>目录 <code>${esc(l.tileName || "?")}</code></span>
+      <span>配置层级 <code>${l.confMin}-${l.confMax}</code></span>
+      <span>区域 <code>${l.lrsCount}</code></span>
+      ${l.meta && l.meta.tileCount ? `<span>瓦片 <code>${Number(l.meta.tileCount).toLocaleString()}</code></span>` : ""}
+    </div>
+    <div class="kv" style="margin-top:4px">
+      <span>pmtiles <code>${l.pmtiles ? fmtSize(l.pmtiles.size) + " · " + fmtTime(l.pmtiles.modified) : state.info.storage && state.info.storage.minioReady ? "未打包" : "未配置 MinIO"}</code></span>
+      <span>下载目录 <code>${l.output ? "有" : "无"}</code></span>
     </div>`;
   const banners = $("#panel-banners");
   let html = "";
   if (l.error) html += `<div class="banner danger">${esc(l.error)}</div>`;
+  if (l.missing && l.missing.length) html += `<div class="banner">pmtiles 缺少 ${l.missing.map(esc).join("、")}，以上按 ConfigMap 显示（标「配置」的项）。多半是早期打包时瓦片目录没有 metadata.json；重新下载并打包后会补齐。</div>`;
+  if (l.mismatch && l.mismatch.length) html += `<div class="banner">pmtiles 与配置不一致：${l.mismatch.map(esc).join("；")}</div>`;
   if (l.sharedWith && l.sharedWith.length) html += `<div class="banner">与 ${l.sharedWith.map(esc).join("、")} 共用目录 <b>${esc(l.tileName)}</b>，同一时间只能有一个任务；pmtiles 的 bounds 以最后一次执行的配置为准。</div>`;
   const running = l.lastJob && (l.lastJob.phase === "Running" || l.lastJob.phase === "Pending");
   if (running) html += `<div class="banner">任务 ${esc(l.lastJob.name)} ${PHASE_TEXT[l.lastJob.phase]}，结束前不能再派发。</div>`;
@@ -598,7 +778,7 @@ function renderRegions() {
         <span class="lrs-key">${esc(x.key)}${x.missing ? ' <span class="lrs-missing">缺少 geojson</span>' : ""}</span>
         <span class="lrs-zoom">z${x.min}-${x.max}</span>
       </div>`).join("");
-  const zmin = Math.max(0, (l && l.max) ? Math.min(l.max + 1, 18) : 13);
+  const zmin = Math.max(0, (l && l.confMax) ? Math.min(l.confMax + 1, 18) : 13);
   const proxyEnabled = state.info.proxy;
   body.innerHTML = `
     <div class="section">
@@ -630,8 +810,9 @@ function renderRegions() {
       </label>
       <label class="field" id="f-proxy-url-wrap" hidden><span id="f-proxy-url-label">代理地址</span><input id="f-proxy-url" spellcheck="false"></label>
       <p class="hint" id="proxy-hint"></p>
-      <label class="check autopack"><input type="checkbox" id="f-autopack"> 下载完成后自动打包上传</label>
-      <p class="hint" id="autopack-hint"></p>
+      ${state.info.storage && state.info.storage.upload
+        ? '<label class="check autopack"><input type="checkbox" id="f-autopack"> 下载完成后自动打包上传</label><p class="hint" id="autopack-hint"></p>'
+        : `<p class="hint">${esc((state.info.storage && state.info.storage.uploadReason) || "未配置上传存储")}。下载结果在下载目录里，可在地图左上角切到「A 下载目录」查看。</p>`}
       <div class="actions">
         <button class="btn primary" id="dispatch-btn" type="button">派发下载</button>
         <button class="btn" id="rerun-btn" type="button">重新下载</button>
@@ -668,7 +849,7 @@ function renderRegions() {
   ["#f-min", "#f-max", "#f-name"].forEach((s) => $(s).addEventListener("input", () => { renderEstimate(); renderDispatchState(); }));
   $("#f-proxy").addEventListener("change", renderProxyField);
   $("#f-proxy-url").addEventListener("input", renderDispatchState);
-  $("#f-autopack").addEventListener("change", renderAutopackHint);
+  $("#f-autopack")?.addEventListener("change", renderAutopackHint);
   $("#dispatch-btn").addEventListener("click", dispatchRegion);
   $("#rerun-btn").addEventListener("click", rerun);
   renderTools();
@@ -687,7 +868,9 @@ function renderAutopackHint() {
 }
 
 const autoPack = () => !!$("#f-autopack")?.checked;
-const packText = (on) => (on ? "下载完成后自动打包上传" : "只下载，完成后手动确认打包");
+const packText = (on) => (!(state.info.storage && state.info.storage.upload)
+  ? "只下载（未配置上传存储）"
+  : on ? "下载完成后自动打包上传" : "只下载，完成后手动确认打包");
 
 function renderTools() {
   document.querySelectorAll("#tools [data-mode]").forEach((b) => b.classList.toggle("on", b.dataset.mode === state.draw.mode));
@@ -775,7 +958,7 @@ async function dispatchRegion() {
     <dl class="summary">
       <dt>图层</dt><dd>${esc(l.title)}（${esc(l.tileName)}）</dd>
       <dt>区域</dt><dd>${esc(name)}</dd>
-      <dt>层级</dt><dd>z${zmin} - z${zmax}${zmax > l.max ? `（tm.max 将从 ${l.max} 提到 ${zmax}）` : ""}</dd>
+      <dt>层级</dt><dd>z${zmin} - z${zmax}${zmax > l.confMax ? `（tm.max 将从 ${l.confMax} 提到 ${zmax}）` : ""}</dd>
       <dt>估算</dt><dd>≤ ${n.toLocaleString()} 张瓦片</dd>
       <dt>代理</dt><dd>${esc(proxyLabel(proxy))}</dd>
       <dt>打包</dt><dd>${packText(autoPack())}</dd>
@@ -807,7 +990,7 @@ async function rerun() {
   const ok = await confirmDialog("重新下载", `
     <dl class="summary">
       <dt>图层</dt><dd>${esc(l.title)}（${esc(l.tileName)}）</dd>
-      <dt>配置</dt><dd>${esc(l.configMap)}，${l.lrsCount} 段 lrs，z${l.min}-${l.max}</dd>
+      <dt>配置</dt><dd>${esc(l.configMap)}，${l.lrsCount} 段 lrs，z${l.confMin}-${l.confMax}</dd>
       <dt>代理</dt><dd>${esc(proxyLabel(proxy))}</dd>
       <dt>打包</dt><dd>${packText(autoPack())}</dd>
     </dl>
@@ -1055,7 +1238,7 @@ $("#refresh-layers").addEventListener("click", () => { loadLayers(); if (state.s
 (async function boot() {
   await loadInfo();
   await loadLayers();
-  const first = state.layers.find((l) => l.pmtiles);
+  const first = state.layers.find((l) => !unavailableReason(l)) || state.layers[0];
   if (first) selectLayer(first.id);
   // 轮询：图层状态 15s，选中图层的任务 5s
   setInterval(loadLayers, 15000);

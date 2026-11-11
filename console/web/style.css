@@ -261,3 +261,52 @@ pre.conf {
   .topbar { padding: 0 12px; }
   .topbar-meta { display: none; }
 }
+
+/* 信息来源标记：pmtiles 优先，缺失时按 ConfigMap 兜底 */
+.from { font-size: 10px; line-height: 14px; padding: 0 4px; margin-left: 4px; border-radius: 3px; vertical-align: 1px; font-family: var(--sans); }
+.from.pm { background: var(--accent-soft); color: var(--accent); }
+.from.cm { background: var(--warn-soft); color: var(--warn); }
+.meta-warn {
+  display: inline-grid; place-items: center; width: 13px; height: 13px; margin-right: 5px; border-radius: 50%;
+  background: var(--warn-soft); color: var(--warn); font: 700 10px/1 var(--sans); vertical-align: 1px; cursor: help;
+}
+
+/* ---- 预览来源切换 ---- */
+.src-switch {
+  position: absolute; left: 12px; top: 12px; z-index: 3; width: min(520px, calc(100% - 72px));
+  background: rgba(22,26,31,.94); border: 1px solid var(--line-strong); border-radius: 10px; padding: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+.src-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.src-seg button {
+  border: 1px solid var(--line-strong); background: var(--surface-2); border-radius: 7px; padding: 5px 8px;
+  cursor: pointer; text-align: left; min-width: 0;
+}
+.src-seg button b { display: block; font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.src-seg button small { display: block; font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.src-seg button.on { border-color: var(--accent); background: var(--accent-soft); }
+.src-seg button.on b { color: var(--accent); }
+.src-seg button:disabled { opacity: .4; cursor: not-allowed; }
+.src-url {
+  margin-top: 6px; font: 11px/1.5 var(--mono); color: var(--text-2); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; word-break: break-all;
+}
+.src-url .k { color: var(--text-3); font-family: var(--sans); }
+.src-url .arrow { color: var(--accent); }
+.layer-side .avail { display: inline-flex; gap: 2px; margin-top: 2px; }
+.layer-side .avail span { font: 10px/13px var(--mono); padding: 0 3px; border-radius: 3px; background: var(--surface-3); color: var(--text-3); }
+.layer-side .avail span.on { background: var(--accent-soft); color: var(--accent); }
+.chip.off { color: var(--text-3); }
+
+/* ---- 存储页 ---- */
+table.cfg { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.cfg td { padding: 6px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.cfg td:first-child { color: var(--text-2); white-space: nowrap; width: 1%; padding-right: 10px; font-family: var(--mono); font-size: 11.5px; }
+table.cfg code { font-family: var(--mono); word-break: break-all; color: var(--text); }
+.src-tag { font-size: 10px; padding: 0 5px; border-radius: 3px; margin-left: 6px; white-space: nowrap; }
+.src-tag.env { background: rgba(90,162,232,.16); color: var(--run); }
+.src-tag.json { background: var(--accent-soft); color: var(--accent); }
+.src-tag.default { background: var(--surface-3); color: var(--text-2); }
+.src-tag.none { background: var(--surface-3); color: var(--text-3); }
+@media (max-width: 820px) { .src-switch { width: calc(100% - 64px); } .src-seg button small { display: none; } }
+.topbar-meta .chip { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }

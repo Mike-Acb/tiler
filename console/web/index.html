@@ -16,6 +16,8 @@
   </div>
   <div class="topbar-meta">
     <span class="chip" id="ns-chip">—</span>
+    <span class="chip" id="output-chip" title="下载目录：下载 Job 写入，预览 A 读取"></span>
+    <span class="chip" id="minio-chip"></span>
     <span class="chip warn" id="dry-chip" hidden>演练模式 · 写操作不落地</span>
   </div>
   <div class="topbar-actions">
@@ -34,6 +36,10 @@
 
   <section class="map-wrap">
     <div id="map"></div>
+    <div class="src-switch" id="src-switch">
+      <div class="src-seg" id="src-seg" role="radiogroup" aria-label="预览来源"></div>
+      <div class="src-url" id="src-url"></div>
+    </div>
     <div class="map-hud" id="map-hud"></div>
     <div class="draw-hint" id="draw-hint" hidden></div>
     <section class="log-drawer" id="log-drawer" hidden>

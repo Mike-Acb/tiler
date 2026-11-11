@@ -15,13 +15,24 @@ import (
 
 // Registry 描述控制台管理的图层，以及生成 Job 用到的集群资源名。
 type Registry struct {
-	Namespace        string            `json:"namespace"`
-	Images           Images            `json:"images"`
-	OutputPVC        string            `json:"outputPVC"`
-	ProxyConfigMap   string            `json:"proxyConfigMap"`
-	MinioConfigMap   string            `json:"minioConfigMap"`
-	MinioSecret      string            `json:"minioSecret"`
-	GeojsonMountPath string            `json:"geojsonMountPath"`
+	Namespace        string `json:"namespace"`
+	Images           Images `json:"images"`
+	ProxyConfigMap   string `json:"proxyConfigMap"`
+	GeojsonMountPath string `json:"geojsonMountPath"`
+
+	// ---- 存储与预览（环境变量优先，见 storage.go）----
+	OutputPVC string `json:"outputPVC"`           // 下载目录 PVC：下载 Job 写入
+	OutputDir string `json:"outputDir,omitempty"` // OUTPUT_DIR：控制台里的只读挂载路径，默认 /data/output
+	// 上传目标（可选）。打包 Job 通过这两个资源拿 MinIO 地址和凭证。
+	MinioConfigMap string `json:"minioConfigMap,omitempty"`
+	MinioSecret    string `json:"minioSecret,omitempty"`
+	MinioEndpoint  string `json:"minioEndpoint,omitempty"` // MINIO_ENDPOINT：控制台自己读 MinIO 用
+	MinioBucket    string `json:"minioBucket,omitempty"`   // MINIO_BUCKET
+	// PMTILES_PUBLIC_URL：浏览器可直读的 pmtiles 基础地址（含桶），预览 B 直连；为空则经控制台中转。
+	PMTilesPublicURL string `json:"pmtilesPublicUrl,omitempty"`
+	// TILE_SERVER_URL / TILE_SERVER_PREFIX：go-pmtiles serve 地址与桶内前缀，预览 C 经反向代理读取。
+	TileServer       string            `json:"tileServer,omitempty"`
+	TileServerPrefix string            `json:"tileServerPrefix,omitempty"`
 	JobTTLSeconds    int               `json:"jobTTLSeconds"`
 	NodeSelector     map[string]string `json:"nodeSelector,omitempty"`
 	Layers           []LayerEntry      `json:"layers"`
