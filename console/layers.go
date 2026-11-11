@@ -119,6 +119,42 @@ func pmtilesKey(minioPath, tileName string) string {
 var keyChars = regexp.MustCompile(`[^a-z0-9_-]+`)
 
 // regionKey 把用户输入的名称转成 ConfigMap 可用的 key（[-._a-zA-Z0-9]）。
+// regionRef 指向一个已配置区域：图层（复制来源时用）+ geojson 键 + 层级。
+type regionRef struct {
+	Layer string `json:"layer,omitempty"`
+	Key   string `json:"key"`
+	Min   int    `json:"min"`
+	Max   int    `json:"max"`
+}
+
+// pickRegionKey 决定新区域在目标 geojson ConfigMap 里用哪个键、要不要写入。
+//   - 新画的区域：按名称加时间生成新键，写入；
+//   - 复制已配置区域：目标里没有这个键就原样写入；已有且内容相同（多个图层共用一个 ConfigMap）就直接引用不写；
+//     同名但内容不同则另起新键，避免覆盖别的图层在用的区域。
+func pickRegionKey(existing map[string]string, from *regionRef, geo []byte, name string, now time.Time) (key string, write bool) {
+	if from == nil {
+		return regionKey(name, now), true
+	}
+	old, ok := existing[from.Key]
+	switch {
+	case !ok:
+		return from.Key, true
+	case old == string(geo):
+		return from.Key, false
+	}
+	return regionKey(name, now), true
+}
+
+// hasRegion 图层配置里是否已有同一区域、同样层级的 [[lrs]]。
+func hasRegion(conf *TilerConf, key string, min, max int) bool {
+	for _, x := range conf.Lrs {
+		if geojsonBase(x.Geojson) == key && x.Min == min && x.Max == max {
+			return true
+		}
+	}
+	return false
+}
+
 func regionKey(name string, now time.Time) string {
 	k := keyChars.ReplaceAllString(strings.ToLower(strings.TrimSpace(name)), "-")
 	k = strings.Trim(k, "-_")

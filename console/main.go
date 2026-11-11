@@ -175,6 +175,7 @@ type layerState struct {
 	PMTilesURL     string       `json:"pmtilesUrl,omitempty"`     // 预览 B：pmtiles.js 读取地址
 	TileServerPath string       `json:"tileServerPath,omitempty"` // 预览 C：go-pmtiles serve 的瓦片集名
 	LrsCount       int          `json:"lrsCount"`
+	Regions        []regionRef  `json:"regions"` // 已配置区域（geojson 键 + 层级），页面判断复制目标是否已有
 	PMTilesKey     string       `json:"pmtilesKey,omitempty"`
 	PMTiles        *objInfo     `json:"pmtiles,omitempty"`
 	LastJob        *jobBrief    `json:"lastJob,omitempty"`
@@ -211,6 +212,10 @@ func (s *Server) loadLayer(ctx context.Context, l *LayerEntry, withObject bool) 
 	}
 	st.conf = conf
 	st.TileName, st.LrsCount = conf.TM.Name, len(conf.Lrs)
+	st.Regions = make([]regionRef, 0, len(conf.Lrs))
+	for _, x := range conf.Lrs {
+		st.Regions = append(st.Regions, regionRef{Key: geojsonBase(x.Geojson), Min: x.Min, Max: x.Max})
+	}
 	st.ConfMin, st.ConfMax = conf.TM.Min, conf.TM.Max
 	st.ConfFormat = conf.TM.Format
 	st.PMTilesKey = pmtilesKey(l.MinioPath, conf.TM.Name)
@@ -383,6 +388,8 @@ type addRegionReq struct {
 	Min      int             `json:"min"`
 	Max      int             `json:"max"`
 	Geojson  json.RawMessage `json:"geojson"`
+	// From 复制已配置区域：取源图层 geojson ConfigMap 里的这个键，不传 Geojson
+	From *regionRef `json:"from,omitempty"`
 }
 
 func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
@@ -405,7 +412,14 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Errorf("层级范围无效: %d-%d", req.Min, req.Max))
 		return
 	}
-	geo, err := normalizeRegion(req.Geojson, name)
+	var geo []byte
+	var src *LayerEntry
+	var err error
+	if req.From != nil {
+		src, geo, err = s.regionData(req.From)
+	} else {
+		geo, err = normalizeRegion(req.Geojson, name)
+	}
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -434,23 +448,32 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	key := regionKey(name, now)
 	gcm, err := s.kube.GetConfigMap(l.GeojsonConfigMap)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	if _, exists := gcm.Data[key]; exists {
-		writeErr(w, 409, fmt.Errorf("geojson %s 已存在", key))
+	if gcm.Data == nil {
+		gcm.Data = map[string]string{}
+	}
+	key, write := pickRegionKey(gcm.Data, req.From, geo, name, now)
+	if hasRegion(st.conf, key, req.Min, req.Max) {
+		writeErr(w, 409, fmt.Errorf("图层已有区域 %s（%d-%d 级）", key, req.Min, req.Max))
 		return
 	}
-	total := len(geo)
-	for k, v := range gcm.Data {
-		total += len(k) + len(v)
-	}
-	if total > 900*1024 {
-		writeErr(w, 400, fmt.Errorf("ConfigMap %s 加上新区域约 %d KB，超过 900 KB 安全上限，请简化多边形", l.GeojsonConfigMap, total/1024))
-		return
+	if write {
+		if _, exists := gcm.Data[key]; exists {
+			writeErr(w, 409, fmt.Errorf("geojson %s 已存在", key))
+			return
+		}
+		total := len(geo)
+		for k, v := range gcm.Data {
+			total += len(k) + len(v)
+		}
+		if total > 900*1024 {
+			writeErr(w, 400, fmt.Errorf("ConfigMap %s 加上新区域约 %d KB，超过 900 KB 安全上限，请简化多边形", l.GeojsonConfigMap, total/1024))
+			return
+		}
 	}
 
 	ccm, err := s.kube.GetConfigMap(l.ConfigMap)
@@ -465,10 +488,12 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 	}
 	parsed, _ := parseConf(newConf)
 
-	gcm.Data[key] = string(geo)
-	if err := s.kube.UpdateConfigMap(gcm); err != nil {
-		writeErr(w, 500, fmt.Errorf("写入 geojson 失败: %w", err))
-		return
+	if write {
+		gcm.Data[key] = string(geo)
+		if err := s.kube.UpdateConfigMap(gcm); err != nil {
+			writeErr(w, 500, fmt.Errorf("写入 geojson 失败: %w", err))
+			return
+		}
 	}
 	ccm.Data["conf.toml"] = newConf
 	if err := s.kube.UpdateConfigMap(ccm); err != nil {
@@ -478,6 +503,9 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 	kind := downloadKind(req.AutoPack)
 	jn := jobName(l.ID, kind, now)
 	reason := fmt.Sprintf("新增区域 %s（%d-%d 级）", name, req.Min, req.Max)
+	if src != nil && src.ID != l.ID {
+		reason = fmt.Sprintf("复制区域 %s（%d-%d 级，来自%s）", name, req.Min, req.Max, src.Title)
+	}
 	meta := ""
 	if kind == KindAll {
 		meta = packMetadata(parsed, gcm.Data)
@@ -488,6 +516,26 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("派发 %s：图层 %s %s", jn, l.ID, reason)
 	writeJSON(w, 201, map[string]any{"job": jn, "geojsonKey": key, "dryRun": s.kube.dryRun})
+}
+
+// regionData 读取某图层已配置区域的 geojson，复制区域时用。
+func (s *Server) regionData(ref *regionRef) (*LayerEntry, []byte, error) {
+	src, ok := s.reg.layer(ref.Layer)
+	if !ok {
+		return nil, nil, fmt.Errorf("源图层 %q 不存在", ref.Layer)
+	}
+	if ref.Key == "" || strings.ContainsAny(ref.Key, `/\`) {
+		return nil, nil, fmt.Errorf("源区域 %q 无效", ref.Key)
+	}
+	cm, err := s.kube.GetConfigMap(src.GeojsonConfigMap)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取 ConfigMap %s 失败: %w", src.GeojsonConfigMap, err)
+	}
+	data, ok := cm.Data[ref.Key]
+	if !ok || !json.Valid([]byte(data)) {
+		return nil, nil, fmt.Errorf("%s 里没有区域 %s", src.GeojsonConfigMap, ref.Key)
+	}
+	return src, []byte(data), nil
 }
 
 func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {

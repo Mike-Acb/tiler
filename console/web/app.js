@@ -28,6 +28,9 @@ const state = {
   lrsHidden: new Set(),
   tab: "regions",
   draft: null,          // 待派发区域 FeatureCollection
+  copy: null,           // 复制已配置区域：{ layer, title, key, cm, min, max }
+  targets: new Set(),   // 「派发到图层」勾选的图层 id
+  multiResult: null,    // 多图层派发结果 [{ t, ok, job?, msg? }]
   draw: { mode: null, points: [], start: null },
   jobs: [],
   showLegacy: false,
@@ -567,7 +570,7 @@ async function loadLayers() {
   // 下载完成 / 打包上传后数据版本变了：已显示的图层按当前来源重建
   refreshTileLayers();
   renderLayers();
-  if (state.selected) { renderPanelHead(); renderDispatchState(); }
+  if (state.selected) { renderPanelHead(); renderTargets(); renderDispatchState(); }
 }
 
 async function selectLayer(id) {
@@ -576,6 +579,9 @@ async function selectLayer(id) {
     state.detail = null;
     state.lrsHidden.clear();
     state.activeJob = null;
+    state.copy = null;
+    state.targets = new Set([id]);
+    state.multiResult = null;
     setDraft(null);
   }
   renderLayers();
@@ -773,10 +779,11 @@ function renderRegions() {
   const d = state.detail;
   const l = currentLayer();
   const lrsHTML = !d ? '<div class="muted">加载中…</div>' : d.lrs.map((x, i) => `
-      <div class="lrs-item ${state.lrsHidden.has(i) ? "off" : ""}" data-i="${i}" title="单击定位，Alt+单击显示/隐藏">
+      <div class="lrs-item ${state.lrsHidden.has(i) ? "off" : ""} ${isCopySource(x) ? "src" : ""}" data-i="${i}" title="单击定位，Alt+单击显示/隐藏">
         <span class="swatch" style="background:${PALETTE[i % PALETTE.length]}"></span>
         <span class="lrs-key">${esc(x.key)}${x.missing ? ' <span class="lrs-missing">缺少 geojson</span>' : ""}</span>
         <span class="lrs-zoom">z${x.min}-${x.max}</span>
+        ${x.missing ? "<span></span>" : `<button class="btn small copy-btn" type="button" data-copy="${i}" title="把这个区域带到下方表单，派发到其他图层">复制到…</button>`}
       </div>`).join("");
   const zmin = Math.max(0, (l && l.confMax) ? Math.min(l.confMax + 1, 18) : 13);
   const proxyEnabled = state.info.proxy;
@@ -785,9 +792,15 @@ function renderRegions() {
       <h3>已配置区域 <span class="muted" style="letter-spacing:0;font-weight:400">单击定位 · Alt+单击隐藏</span></h3>
       ${lrsHTML || '<div class="muted">没有 lrs</div>'}
     </div>
-    <div class="section">
+    <div class="section" id="new-region">
       <h3>新增区域</h3>
-      <div class="tools" id="tools">
+      ${state.copy ? `
+      <div class="copy-src">
+        <div>复制 <b>${esc(state.copy.title)}</b> 的已配置区域 <code>${esc(state.copy.key)}</code>
+          <div class="hint">原层级 z${state.copy.min}-${state.copy.max}，可以改；在下面勾选要派发的图层。</div></div>
+        <button class="icon-btn" id="copy-clear" type="button" title="不复制了，改为自己圈选" aria-label="取消复制">✕</button>
+      </div>` : ""}
+      <div class="tools" id="tools" ${state.copy ? "hidden" : ""}>
         <button class="btn small" data-mode="rect" type="button">▭ 矩形</button>
         <button class="btn small" data-mode="poly" type="button">⬠ 多边形</button>
         <button class="btn small" id="import-btn" type="button">导入 GeoJSON</button>
@@ -800,6 +813,7 @@ function renderRegions() {
         <label class="field"><span>结束层级</span><input id="f-max" type="number" min="0" max="22" value="${Math.min(zmin + 2, 22)}"></label>
       </div>
       <div class="estimate" id="estimate"><span>先在地图上圈选区域</span></div>
+      <div class="targets" id="targets"></div>
       <label class="field"><span>下载代理</span>
         <select id="f-proxy">
           <option value="default">按图层默认${l && l.proxy ? "（tiler-proxy-config）" : "（直连）"}</option>
@@ -817,9 +831,15 @@ function renderRegions() {
         <button class="btn primary" id="dispatch-btn" type="button">派发下载</button>
         <button class="btn" id="rerun-btn" type="button">重新下载</button>
       </div>
-      <p class="hint">新区域会追加到 ${esc(l ? l.configMap : "")} 的 [[lrs]]，并写入 ${esc(l ? l.geojsonConfigMap : "")}；已下载的瓦片会跳过。</p>
+      <div id="multi-result"></div>
+      <p class="hint">新区域会追加到各图层 ConfigMap 的 [[lrs]]，geojson 写入对应的 geojson ConfigMap（共用的只写一份）；已下载的瓦片会跳过。</p>
     </div>`;
 
+  body.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    startCopy(Number(b.dataset.copy));
+  }));
+  $("#copy-clear")?.addEventListener("click", () => cancelCopy());
   body.querySelectorAll(".lrs-item").forEach((el) => el.addEventListener("click", (e) => {
     const i = Number(el.dataset.i);
     if (e.altKey) {
@@ -846,17 +866,119 @@ function renderRegions() {
     } catch (ex) { toast("导入失败：" + ex.message, true); }
   });
   $("#clear-btn").addEventListener("click", () => { stopDraw(); setDraft(null); });
-  ["#f-min", "#f-max", "#f-name"].forEach((s) => $(s).addEventListener("input", () => { renderEstimate(); renderDispatchState(); }));
+  ["#f-min", "#f-max", "#f-name"].forEach((s) => $(s).addEventListener("input", () => { renderEstimate(); renderTargets(); renderDispatchState(); }));
   $("#f-proxy").addEventListener("change", renderProxyField);
   $("#f-proxy-url").addEventListener("input", renderDispatchState);
   $("#f-autopack")?.addEventListener("change", renderAutopackHint);
   $("#dispatch-btn").addEventListener("click", dispatchRegion);
   $("#rerun-btn").addEventListener("click", rerun);
+  if (state.copy) {
+    $("#f-name").value = regionName(state.copy.key);
+    $("#f-min").value = state.copy.min;
+    $("#f-max").value = state.copy.max;
+  }
   renderTools();
   renderEstimate();
+  renderTargets();
+  renderMultiResult();
   renderProxyField();
   renderAutopackHint();
   renderDispatchState();
+}
+
+// ---- 复制已配置区域 / 派发到多个图层 ----
+const regionName = (key) => key.replace(/\.geojson$/i, "").replace(/-\d{8}-\d{6}$/, "");
+const isCopySource = (x) => !!state.copy && state.copy.layer === state.selected && state.copy.key === x.key;
+
+function startCopy(i) {
+  const l = currentLayer(), x = state.detail && state.detail.lrs[i];
+  if (!l || !x || !x.data) return;
+  stopDraw();
+  state.copy = { layer: l.id, title: l.title || l.id, key: x.key, cm: l.geojsonConfigMap, min: x.min, max: x.max };
+  state.targets = new Set();
+  state.multiResult = null;
+  renderRegions();
+  setDraft(x.data);
+  fitTo(x.data);
+  $("#new-region").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function cancelCopy() {
+  state.copy = null;
+  state.targets = new Set(state.selected ? [state.selected] : []);
+  setDraft(null);
+  renderRegions();
+}
+
+// 目标图层不能派发的原因；空串表示可以
+function targetBlock(t) {
+  if (!t.tileName) return "配置读取失败";
+  if (t.lastJob && (t.lastJob.phase === "Running" || t.lastJob.phase === "Pending")) return "有任务在执行";
+  if (state.copy && t.geojsonConfigMap === state.copy.cm) {
+    const { zmin, zmax } = zoomRange();
+    if ((t.regions || []).some((r) => r.key === state.copy.key && r.min === zmin && r.max === zmax)) return "已有此区域";
+  }
+  return "";
+}
+
+const pickedTargets = () => state.layers.filter((t) => state.targets.has(t.id) && !targetBlock(t));
+
+function renderTargets() {
+  const box = $("#targets");
+  if (!box) return;
+  const { zmax, valid } = zoomRange();
+  const groups = [...new Set(state.layers.map((t) => t.group || "其他"))];
+  const n = pickedTargets().length;
+  box.innerHTML = `
+    <div class="targets-head"><span>派发到图层 · 已选 ${n}</span>
+      <span><button class="btn small ghost" type="button" data-pick="group">同组全选</button><button class="btn small ghost" type="button" data-pick="none">清空</button></span></div>
+    ${groups.map((g) => `<div class="targets-group">${esc(g)}</div>` + state.layers.filter((t) => (t.group || "其他") === g).map((t) => {
+      const why = targetBlock(t);
+      const up = !why && state.draft && valid && t.confMax != null && zmax > t.confMax ? `<span class="t-note warn" title="tm.max 会从 ${t.confMax} 提到 ${zmax}">z${t.confMax} → z${zmax}</span>` : "";
+      return `<label class="t-row ${why ? "dis" : ""}">
+        <input type="checkbox" data-target="${esc(t.id)}" ${state.targets.has(t.id) && !why ? "checked" : ""} ${why ? "disabled" : ""}>
+        <span class="t-name">${esc(t.title || t.id)}${t.id === state.selected ? ' <span class="muted">（当前）</span>' : ""}</span>
+        ${why ? `<span class="t-note ${why === "有任务在执行" ? "run" : ""}">${why}</span>` : up}
+      </label>`;
+    }).join("")).join("")}`;
+  box.querySelectorAll("[data-target]").forEach((c) => c.addEventListener("change", () => {
+    c.checked ? state.targets.add(c.dataset.target) : state.targets.delete(c.dataset.target);
+    renderTargets();
+    renderDispatchState();
+  }));
+  box.querySelector('[data-pick="group"]').addEventListener("click", () => {
+    const g = (currentLayer() || {}).group || "其他";
+    state.layers.filter((t) => (t.group || "其他") === g && !targetBlock(t)).forEach((t) => state.targets.add(t.id));
+    renderTargets();
+    renderDispatchState();
+  });
+  box.querySelector('[data-pick="none"]').addEventListener("click", () => {
+    state.targets.clear();
+    renderTargets();
+    renderDispatchState();
+  });
+}
+
+function renderMultiResult() {
+  const box = $("#multi-result");
+  if (!box) return;
+  const rs = state.multiResult;
+  if (!rs || !rs.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="multi-result">${rs.map((r) => `
+    <div class="mr-row">
+      <span>${esc(r.t.title || r.t.id)}</span>
+      ${r.ok
+        ? `<span class="mr-ok">${r.dryRun ? "演练通过" : "已派发"} <button class="link" type="button" data-open-job="${esc(r.job)}" data-layer="${esc(r.t.id)}">${esc(r.job)}</button></span>`
+        : `<span class="mr-err" title="${esc(r.msg)}">失败：${esc(r.msg)}</span>`}
+    </div>`).join("")}</div>`;
+  box.querySelectorAll("[data-open-job]").forEach((b) => b.addEventListener("click", async () => {
+    const job = b.dataset.openJob;
+    await selectLayer(b.dataset.layer);
+    state.tab = "jobs";
+    renderPanel();
+    await loadJobs();
+    openJob(job);
+  }));
 }
 
 function renderAutopackHint() {
@@ -942,46 +1064,91 @@ function renderDispatchState() {
   const p = proxyPayload();
   const proxyOk = !(p.mode === "upstream" && !p.url);
   const name = ($("#f-name").value || "").trim();
-  btn.disabled = !!busy || !state.draft || !valid || !name || !proxyOk;
-  btn.title = busy || (!state.draft ? "先圈选区域" : !name ? "填写区域名称" : !valid ? "层级范围无效" : !proxyOk ? "填写上游代理地址" : "");
+  const n = pickedTargets().length;
+  const ro = state.info.writable ? "" : "服务端未配置口令，写操作已禁用";
+  btn.disabled = !!ro || !state.draft || !valid || !name || !proxyOk || !n;
+  btn.textContent = n > 1 ? `派发到 ${n} 个图层` : "派发下载";
+  btn.title = ro || (!state.draft ? "先圈选区域" : !name ? "填写区域名称" : !valid ? "层级范围无效" : !proxyOk ? "填写上游代理地址" : !n ? "勾选要派发的图层" : "");
   rerunBtn.disabled = !!busy || !proxyOk;
   rerunBtn.title = busy || "不改配置，按当前 conf.toml 补齐缺失瓦片";
 }
 
 async function dispatchRegion() {
-  const l = currentLayer();
+  const targets = pickedTargets();
+  if (!targets.length) return;
   const { zmin, zmax } = zoomRange();
   const name = $("#f-name").value.trim();
   const proxy = proxyPayload();
+  const ap = autoPack();
   const n = estimateTiles(state.draft, zmin, zmax);
-  const ok = await confirmDialog("派发下载", `
+  const copy = state.copy;
+  // 每个图层的 geojson 去向：同一个 geojson ConfigMap 只写一次，其余引用
+  const written = new Set();
+  const rows = targets.map((t) => {
+    let geo;
+    if (copy && t.geojsonConfigMap === copy.cm) geo = `引用 ${esc(t.geojsonConfigMap)} 里的 ${esc(copy.key)}`;
+    else if (written.has(t.geojsonConfigMap)) geo = `引用同一份 geojson（${esc(t.geojsonConfigMap)}）`;
+    else { written.add(t.geojsonConfigMap); geo = `写入 ${esc(t.geojsonConfigMap)}`; }
+    const up = zmax > t.confMax ? ` <span class="tag warn">tm.max ${t.confMax} → ${zmax}</span>` : "";
+    return `<tr><td>${esc(t.title || t.id)}</td><td>追加 [[lrs]] z${zmin}-${zmax}${up}<div class="muted">${esc(t.configMap)} · ${geo}</div></td></tr>`;
+  }).join("");
+  const ok = await confirmDialog(targets.length > 1 ? `派发到 ${targets.length} 个图层` : "派发下载", `
     <dl class="summary">
-      <dt>图层</dt><dd>${esc(l.title)}（${esc(l.tileName)}）</dd>
-      <dt>区域</dt><dd>${esc(name)}</dd>
-      <dt>层级</dt><dd>z${zmin} - z${zmax}${zmax > l.confMax ? `（tm.max 将从 ${l.confMax} 提到 ${zmax}）` : ""}</dd>
-      <dt>估算</dt><dd>≤ ${n.toLocaleString()} 张瓦片</dd>
+      <dt>区域</dt><dd>${esc(name)}${copy ? `（复制自${esc(copy.title)}的 ${esc(copy.key)}）` : ""}</dd>
+      <dt>层级</dt><dd>z${zmin} - z${zmax}</dd>
+      <dt>估算</dt><dd>每个图层 ≤ ${n.toLocaleString()} 张瓦片</dd>
       <dt>代理</dt><dd>${esc(proxyLabel(proxy))}</dd>
-      <dt>打包</dt><dd>${packText(autoPack())}</dd>
+      <dt>打包</dt><dd>${packText(ap)}</dd>
     </dl>
-    <p class="hint">会修改 ConfigMap ${esc(l.configMap)} 和 ${esc(l.geojsonConfigMap)}，然后创建 Job。${state.info.dryRun ? "<br>当前是演练模式，不会真正写入。" : ""}</p>`, "派发");
+    <table class="plan"><thead><tr><th>图层</th><th>会做什么</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="hint">每个图层各建一个 Job，互不影响；某个图层失败不影响其他图层，结果逐个列出。${state.info.dryRun ? "<br>当前是演练模式，不会真正写入。" : ""}</p>`, "派发");
   if (!ok) return;
   const btn = $("#dispatch-btn");
   btn.disabled = true;
   btn.textContent = "派发中…";
-  try {
-    const res = await api(`/api/layers/${encodeURIComponent(l.id)}/regions`, {
-      method: "POST", auth: true,
-      body: { name, min: zmin, max: zmax, geojson: state.draft, proxy, autoPack: autoPack() },
-    });
+  // 复制时各图层都引用源区域；新画的区域第一个图层写入后，其余图层引用它
+  let from = copy ? { layer: copy.layer, key: copy.key } : null;
+  const results = [];
+  for (const t of targets) {
+    const body = { name, min: zmin, max: zmax, proxy, autoPack: ap };
+    if (from) body.from = from; else body.geojson = state.draft;
+    try {
+      const res = await api(`/api/layers/${encodeURIComponent(t.id)}/regions`, { method: "POST", auth: true, body });
+      results.push({ t, ok: true, job: res.job, dryRun: res.dryRun, res });
+      if (!from && !res.dryRun) from = { layer: t.id, key: res.geojsonKey };
+    } catch (e) {
+      results.push({ t, ok: false, msg: e.message });
+      if (!state.token) break; // 没解锁或口令失效，后面的也会失败
+    }
+  }
+  btn.textContent = "派发下载";
+  const okN = results.filter((r) => r.ok).length;
+  if (targets.length === 1 && okN === 1) {
+    const res = results[0].res;
     toast(res.dryRun ? `演练通过：将创建 ${res.job}` : `已派发 ${res.job}`);
+    state.copy = null;
     setDraft(null);
     await afterDispatch(res);
-  } catch (e) {
-    toast(e.message, true);
-  } finally {
-    btn.textContent = "派发下载";
-    renderDispatchState();
+    return;
   }
+  if (targets.length === 1) { toast(results[0].msg, true); renderDispatchState(); return; }
+  const failed = results.filter((r) => !r.ok);
+  toast(`已派发 ${okN} 个图层${failed.length ? `，失败 ${failed.length} 个` : ""}`, failed.length > 0);
+  if (!failed.length) {
+    state.copy = null;
+    setDraft(null);
+    state.targets = new Set(state.selected ? [state.selected] : []);
+  } else {
+    // 保留区域和复制来源，只勾上失败的图层，处理完原因后可直接重试
+    state.targets = new Set(failed.map((r) => r.t.id));
+  }
+  state.multiResult = results;
+  await loadLayers();
+  if (okN && results.some((r) => r.ok && r.t.id === state.selected)) {
+    const detail = await api("/api/layers/" + encodeURIComponent(state.selected)).catch(() => null);
+    if (detail) { state.detail = detail; drawLrs(); }
+  }
+  if (state.tab === "regions") renderRegions();
 }
 
 async function rerun() {

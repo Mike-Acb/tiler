@@ -272,3 +272,29 @@ func TestPendingPack(t *testing.T) {
 		t.Fatalf("其他目录的下载不算: %+v", p)
 	}
 }
+
+func TestPickRegionKey(t *testing.T) {
+	now := time.Date(2026, 11, 11, 10, 30, 0, 0, time.UTC)
+	geo := []byte(`{"type":"FeatureCollection"}`)
+	from := &regionRef{Layer: "a", Key: "hangzhou.geojson"}
+
+	if k, w := pickRegionKey(map[string]string{}, nil, geo, "Taipei 101", now); k != "taipei-101-20261111-103000.geojson" || !w {
+		t.Fatalf("新画区域: %s %v", k, w)
+	}
+	if k, w := pickRegionKey(map[string]string{}, from, geo, "hangzhou", now); k != "hangzhou.geojson" || !w {
+		t.Fatalf("目标没有该键应原样写入: %s %v", k, w)
+	}
+	if k, w := pickRegionKey(map[string]string{"hangzhou.geojson": string(geo)}, from, geo, "hangzhou", now); k != "hangzhou.geojson" || w {
+		t.Fatalf("共用 ConfigMap、内容相同应直接引用: %s %v", k, w)
+	}
+	if k, w := pickRegionKey(map[string]string{"hangzhou.geojson": "{}"}, from, geo, "hangzhou", now); k != "hangzhou-20261111-103000.geojson" || !w {
+		t.Fatalf("同名不同内容应另起新键: %s %v", k, w)
+	}
+}
+
+func TestHasRegion(t *testing.T) {
+	conf, _ := parseConf(sampleConf) // global 0-7, china 8-12
+	if !hasRegion(conf, "china.geojson", 8, 12) || hasRegion(conf, "china.geojson", 8, 13) || hasRegion(conf, "hz.geojson", 8, 12) {
+		t.Fatal("hasRegion 判断错误")
+	}
+}
