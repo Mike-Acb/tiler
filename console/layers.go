@@ -211,6 +211,7 @@ const (
 	labelTileName = "tiler-console/tile-name"
 	annoReason    = "tiler-console/reason"
 	annoProxy     = "tiler-console/proxy"
+	labelKind     = "tiler-console/kind"
 )
 
 // tileNameLabel 把目录名转成合法 label 值，用来判断两个图层是否写同一个目录。
@@ -223,8 +224,8 @@ func tileNameLabel(name string) string {
 	return v
 }
 
-func jobName(layerID string, now time.Time) string {
-	return "tc-" + layerID + "-" + now.Format("0102-150405")
+func jobName(layerID, kind string, now time.Time) string {
+	return "tc-" + layerID + "-" + kindShort[kind] + "-" + now.Format("0102-150405")
 }
 
 func envFromCM(name, cm, key string, optional bool) map[string]any {
@@ -301,97 +302,129 @@ func (p ProxyOpt) describe() string {
 	return p.Mode
 }
 
-func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason string, proxy ProxyOpt) map[string]any {
-	volumes := []any{
-		map[string]any{"name": "config", "configMap": map[string]any{"name": l.ConfigMap}},
-		map[string]any{"name": "geojson", "configMap": map[string]any{"name": l.GeojsonConfigMap}},
-		map[string]any{"name": "output", "persistentVolumeClaim": map[string]any{"claimName": r.OutputPVC}},
-	}
+// Job 种类：下载与打包拆开，打包需人工确认后再派发；all 为下载完自动打包。
+const (
+	KindDownload = "download"
+	KindPack     = "pack"
+	KindAll      = "all"
+)
+
+var kindShort = map[string]string{KindDownload: "dl", KindPack: "pk", KindAll: "all"}
+
+// buildJob 生成控制台 Job：
+//   - download：代理为原生 sidecar（initContainer + restartPolicy: Always），download 为主容器；
+//   - pack：只有 sync 主容器，把整个目录打包成 pmtiles 上传；
+//   - all：download 为普通 initContainer，结束后 sync 才启动。
+//
+// sync 一律设 WAIT_FOR_DONE=0：顺序由容器编排保证，不依赖输出目录里残留的 .done。
+func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason, kind string, proxy ProxyOpt) map[string]any {
 	outputDir := conf.Output.Directory
 	if outputDir == "" {
 		outputDir = "/data/output"
 	}
-	downloadMounts := []any{
-		map[string]any{"name": "config", "mountPath": "/etc/tiler"},
-		map[string]any{"name": "geojson", "mountPath": r.GeojsonMountPath},
-		map[string]any{"name": "output", "mountPath": outputDir},
+	volumes := []any{
+		map[string]any{"name": "output", "persistentVolumeClaim": map[string]any{"claimName": r.OutputPVC}},
 	}
-	var initContainers []any
-	var downloadEnv []any
-	if proxy.Mode != "direct" {
-		// 每个 Job 独立的 /tmp/proxy：ready 标记和切换触发文件不与其他 Job 共享
-		volumes = append(volumes, map[string]any{"name": "proxy-data", "emptyDir": map[string]any{}})
-		downloadMounts = append(downloadMounts, map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"})
-		var proxyEnv []any
-		switch proxy.Mode {
-		case "upstream":
-			proxyEnv = []any{map[string]any{"name": "UPSTREAM_PROXY", "value": proxy.URL}}
-		case "pool":
-			if proxy.URL != "" {
-				proxyEnv = []any{map[string]any{"name": "PROXY_POOL_API", "value": proxy.URL}}
-			} else {
-				proxyEnv = []any{envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true)}
-			}
-		default:
-			proxyEnv = []any{
-				envFromCM("UPSTREAM_PROXY", r.ProxyConfigMap, "UPSTREAM_PROXY", true),
-				envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true),
-			}
-		}
-		initContainers = append(initContainers, map[string]any{
-			"name":            "proxy",
-			"image":           r.Images.Proxy,
-			"imagePullPolicy": "Always",
-			"restartPolicy":   "Always",
-			"env":             proxyEnv,
-			"volumeMounts":    []any{map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"}},
-			"resources":       resources("100m", "64Mi", "500m", "128Mi"),
-		})
-		downloadEnv = []any{
-			map[string]any{"name": "HTTP_PROXY", "value": "http://localhost:8080"},
-			map[string]any{"name": "HTTPS_PROXY", "value": "http://localhost:8080"},
-		}
-	}
-	download := map[string]any{
-		"name":            "download",
-		"image":           r.Images.Tiler,
-		"imagePullPolicy": "Always",
-		"command":         []any{"./tiler", "-c", "/etc/tiler/conf.toml"},
-		"volumeMounts":    downloadMounts,
-		"resources":       resources("500m", "256Mi", "2", "512Mi"),
-	}
-	if downloadEnv != nil {
-		download["env"] = downloadEnv
-	}
-	initContainers = append(initContainers, download)
+	var initContainers, containers []any
+	annotations := map[string]string{annoReason: reason}
 
-	sync := map[string]any{
-		"name":            "sync",
-		"image":           r.Images.Sync,
-		"imagePullPolicy": "Always",
-		"env": []any{
-			map[string]any{"name": "INPUT_DIR", "value": outputDir},
-			map[string]any{"name": "TILE_NAME", "value": conf.TM.Name},
-			map[string]any{"name": "MINIO_PATH", "value": l.MinioPath},
-			envFromCM("MINIO_ENDPOINT", r.MinioConfigMap, "MINIO_ENDPOINT", false),
-			envFromCM("MINIO_BUCKET", r.MinioConfigMap, "MINIO_BUCKET", false),
-			envFromCM("MINIO_ACCESS_KEY", r.MinioConfigMap, "MINIO_ACCESS_KEY", false),
-			map[string]any{"name": "MINIO_SECRET_KEY", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": r.MinioSecret, "key": "MINIO_SECRET_KEY"}}},
-		},
-		"volumeMounts": []any{map[string]any{"name": "output", "mountPath": outputDir, "readOnly": true}},
-		"resources":    resources("500m", "512Mi", "2", "2Gi"),
+	if kind == KindDownload || kind == KindAll {
+		volumes = append(volumes,
+			map[string]any{"name": "config", "configMap": map[string]any{"name": l.ConfigMap}},
+			map[string]any{"name": "geojson", "configMap": map[string]any{"name": l.GeojsonConfigMap}},
+		)
+		downloadMounts := []any{
+			map[string]any{"name": "config", "mountPath": "/etc/tiler"},
+			map[string]any{"name": "geojson", "mountPath": r.GeojsonMountPath},
+			map[string]any{"name": "output", "mountPath": outputDir},
+		}
+		var downloadEnv []any
+		if proxy.Mode != "direct" {
+			// 每个 Job 独立的 /tmp/proxy：ready 标记和切换触发文件不与其他 Job 共享
+			volumes = append(volumes, map[string]any{"name": "proxy-data", "emptyDir": map[string]any{}})
+			downloadMounts = append(downloadMounts, map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"})
+			var proxyEnv []any
+			switch proxy.Mode {
+			case "upstream":
+				proxyEnv = []any{map[string]any{"name": "UPSTREAM_PROXY", "value": proxy.URL}}
+			case "pool":
+				if proxy.URL != "" {
+					proxyEnv = []any{map[string]any{"name": "PROXY_POOL_API", "value": proxy.URL}}
+				} else {
+					proxyEnv = []any{envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true)}
+				}
+			default:
+				proxyEnv = []any{
+					envFromCM("UPSTREAM_PROXY", r.ProxyConfigMap, "UPSTREAM_PROXY", true),
+					envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true),
+				}
+			}
+			initContainers = append(initContainers, map[string]any{
+				"name":            "proxy",
+				"image":           r.Images.Proxy,
+				"imagePullPolicy": "Always",
+				"restartPolicy":   "Always",
+				"env":             proxyEnv,
+				"volumeMounts":    []any{map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"}},
+				"resources":       resources("100m", "64Mi", "500m", "128Mi"),
+			})
+			downloadEnv = []any{
+				map[string]any{"name": "HTTP_PROXY", "value": "http://localhost:8080"},
+				map[string]any{"name": "HTTPS_PROXY", "value": "http://localhost:8080"},
+			}
+		}
+		download := map[string]any{
+			"name":            "download",
+			"image":           r.Images.Tiler,
+			"imagePullPolicy": "Always",
+			"command":         []any{"./tiler", "-c", "/etc/tiler/conf.toml"},
+			"volumeMounts":    downloadMounts,
+			"resources":       resources("500m", "256Mi", "2", "512Mi"),
+		}
+		if downloadEnv != nil {
+			download["env"] = downloadEnv
+		}
+		if kind == KindAll {
+			initContainers = append(initContainers, download)
+		} else {
+			containers = append(containers, download)
+		}
+		annotations[annoProxy] = proxy.describe()
+	}
+
+	if kind == KindPack || kind == KindAll {
+		containers = append(containers, map[string]any{
+			"name":            "sync",
+			"image":           r.Images.Sync,
+			"imagePullPolicy": "Always",
+			"env": []any{
+				map[string]any{"name": "WAIT_FOR_DONE", "value": "0"},
+				map[string]any{"name": "INPUT_DIR", "value": outputDir},
+				map[string]any{"name": "TILE_NAME", "value": conf.TM.Name},
+				map[string]any{"name": "MINIO_PATH", "value": l.MinioPath},
+				envFromCM("MINIO_ENDPOINT", r.MinioConfigMap, "MINIO_ENDPOINT", false),
+				envFromCM("MINIO_BUCKET", r.MinioConfigMap, "MINIO_BUCKET", false),
+				envFromCM("MINIO_ACCESS_KEY", r.MinioConfigMap, "MINIO_ACCESS_KEY", false),
+				map[string]any{"name": "MINIO_SECRET_KEY", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": r.MinioSecret, "key": "MINIO_SECRET_KEY"}}},
+			},
+			"volumeMounts": []any{map[string]any{"name": "output", "mountPath": outputDir, "readOnly": true}},
+			"resources":    resources("500m", "512Mi", "2", "2Gi"),
+		})
 	}
 
 	labels := map[string]string{
 		labelManaged:  managedValue,
 		labelLayer:    l.ID,
 		labelTileName: tileNameLabel(conf.TM.Name),
+		labelKind:     kind,
 	}
 	podSpec := map[string]any{
-		"restartPolicy":  "Never",
-		"initContainers": initContainers,
-		"containers":     []any{sync},
-		"volumes":        volumes,
+		"restartPolicy": "Never",
+		"containers":    containers,
+		"volumes":       volumes,
+	}
+	if len(initContainers) > 0 {
+		podSpec["initContainers"] = initContainers
 	}
 	if len(r.NodeSelector) > 0 {
 		podSpec["nodeSelector"] = r.NodeSelector
@@ -403,7 +436,7 @@ func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason string, 
 			"name":        name,
 			"namespace":   r.Namespace,
 			"labels":      labels,
-			"annotations": map[string]string{annoReason: reason, annoProxy: proxy.describe()},
+			"annotations": annotations,
 		},
 		"spec": map[string]any{
 			"backoffLimit":            1,

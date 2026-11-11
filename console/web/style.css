@@ -164,6 +164,15 @@ button, input, select { font: inherit; color: inherit; }
 .kv code { font-family: var(--mono); color: var(--text); }
 .banner { margin: 10px 16px 0; padding: 8px 10px; border-radius: 6px; font-size: 12px; background: var(--warn-soft); color: var(--warn); }
 .banner.danger { background: var(--danger-soft); color: var(--danger); }
+.banner.pack { display: grid; gap: 8px; }
+.banner.pack b { font-family: var(--mono); font-weight: 600; }
+.banner-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.tag {
+  display: inline-block; font-size: 11px; line-height: 16px; padding: 0 5px; margin-right: 6px; border-radius: 4px;
+  background: var(--surface-3); color: var(--text-2); font-family: var(--sans); vertical-align: 1px;
+}
+.tag.warn { background: var(--warn-soft); color: var(--warn); margin: 0; }
+.check.autopack { margin-top: 12px; color: var(--text); font-size: 13px; }
 .tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--line); }
 .tab {
   height: 36px; padding: 0 10px; border: 0; background: transparent; color: var(--text-2); cursor: pointer;

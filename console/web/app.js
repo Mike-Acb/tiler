@@ -6,6 +6,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const PALETTE = ["#4fb3a6", "#e0a84f", "#8d8ff0", "#e2685f", "#6cc27a", "#d27ac8", "#5aa2e8", "#c9b458"];
 const PHASE_TEXT = { Running: "执行中", Succeeded: "成功", Failed: "失败", Pending: "等待中" };
 const STATE_TEXT = { running: "运行", done: "完成", failed: "失败", waiting: "等待" };
+const KIND_TEXT = { download: "下载", pack: "打包", all: "下载+打包" };
 
 const store = {
   get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
@@ -499,9 +500,10 @@ function renderLayers() {
       const el = document.createElement("div");
       el.className = "layer-item" + (l.id === state.selected ? " active" : "");
       const job = l.lastJob;
-      const side = job
+      const running = job && (job.phase === "Running" || job.phase === "Pending");
+      const side = running || (job && !l.pendingPack)
         ? `<span class="dot ${job.phase}"></span>${PHASE_TEXT[job.phase] || job.phase}`
-        : "";
+        : l.pendingPack ? '<span class="tag warn">待打包</span>' : "";
       const sub = l.tileName ? `${l.tileName} · ${l.format} · z${l.min}-${l.max}` : l.configMap;
       el.innerHTML = `
         <button class="eye ${state.visible.has(l.id) ? "on" : ""}" type="button" title="${l.pmtiles ? "在地图上显示" : "pmtiles 尚未生成"}" ${l.pmtiles ? "" : "disabled"}>
@@ -567,8 +569,23 @@ function renderPanelHead() {
   let html = "";
   if (l.error) html += `<div class="banner danger">${esc(l.error)}</div>`;
   if (l.sharedWith && l.sharedWith.length) html += `<div class="banner">与 ${l.sharedWith.map(esc).join("、")} 共用目录 <b>${esc(l.tileName)}</b>，同一时间只能有一个任务；pmtiles 的 bounds 以最后一次执行的配置为准。</div>`;
-  if (l.lastJob && (l.lastJob.phase === "Running" || l.lastJob.phase === "Pending")) html += `<div class="banner">任务 ${esc(l.lastJob.name)} ${PHASE_TEXT[l.lastJob.phase]}，结束前不能再派发。</div>`;
+  const running = l.lastJob && (l.lastJob.phase === "Running" || l.lastJob.phase === "Pending");
+  if (running) html += `<div class="banner">任务 ${esc(l.lastJob.name)} ${PHASE_TEXT[l.lastJob.phase]}，结束前不能再派发。</div>`;
+  if (l.pendingPack && !running) html += `
+    <div class="banner pack">
+      <div>下载 <b>${esc(l.pendingPack.job)}</b> 已于 ${fmtTime(l.pendingPack.since)} 完成，线上 pmtiles 还是${l.pmtiles ? " " + fmtTime(l.pmtiles.modified) + " 的版本" : "空的"}。确认下载结果后再打包上传。</div>
+      <div class="banner-actions">
+        <button class="btn small" type="button" data-view-job="${esc(l.pendingPack.job)}">看下载日志</button>
+        <button class="btn small primary" type="button" data-pack>打包上传</button>
+      </div>
+    </div>`;
   banners.innerHTML = html;
+  banners.querySelector("[data-pack]")?.addEventListener("click", packLayer);
+  banners.querySelector("[data-view-job]")?.addEventListener("click", (e) => {
+    state.tab = "jobs";
+    renderPanel();
+    loadJobs().then(() => openJob(e.target.dataset.viewJob));
+  });
 }
 
 function renderRegions() {
@@ -613,11 +630,13 @@ function renderRegions() {
       </label>
       <label class="field" id="f-proxy-url-wrap" hidden><span id="f-proxy-url-label">代理地址</span><input id="f-proxy-url" spellcheck="false"></label>
       <p class="hint" id="proxy-hint"></p>
+      <label class="check autopack"><input type="checkbox" id="f-autopack"> 下载完成后自动打包上传</label>
+      <p class="hint" id="autopack-hint"></p>
       <div class="actions">
         <button class="btn primary" id="dispatch-btn" type="button">派发下载</button>
-        <button class="btn" id="rerun-btn" type="button" title="不改配置，按当前 conf.toml 重新下载并打包">重新执行</button>
+        <button class="btn" id="rerun-btn" type="button">重新下载</button>
       </div>
-      <p class="hint">新区域会追加到 ${esc(l ? l.configMap : "")} 的 [[lrs]]，并写入 ${esc(l ? l.geojsonConfigMap : "")}；已下载的瓦片会跳过，完成后整个目录重新打包上传。</p>
+      <p class="hint">新区域会追加到 ${esc(l ? l.configMap : "")} 的 [[lrs]]，并写入 ${esc(l ? l.geojsonConfigMap : "")}；已下载的瓦片会跳过。</p>
     </div>`;
 
   body.querySelectorAll(".lrs-item").forEach((el) => el.addEventListener("click", (e) => {
@@ -649,13 +668,26 @@ function renderRegions() {
   ["#f-min", "#f-max", "#f-name"].forEach((s) => $(s).addEventListener("input", () => { renderEstimate(); renderDispatchState(); }));
   $("#f-proxy").addEventListener("change", renderProxyField);
   $("#f-proxy-url").addEventListener("input", renderDispatchState);
+  $("#f-autopack").addEventListener("change", renderAutopackHint);
   $("#dispatch-btn").addEventListener("click", dispatchRegion);
   $("#rerun-btn").addEventListener("click", rerun);
   renderTools();
   renderEstimate();
   renderProxyField();
+  renderAutopackHint();
   renderDispatchState();
 }
+
+function renderAutopackHint() {
+  const el = $("#autopack-hint");
+  if (!el) return;
+  el.textContent = $("#f-autopack").checked
+    ? "下载结束后在同一个 Job 里直接打包，覆盖线上 pmtiles，中间不再确认。"
+    : "只下载到目录。完成后图层会标记「待打包」，确认下载结果后再点「打包上传」。";
+}
+
+const autoPack = () => !!$("#f-autopack")?.checked;
+const packText = (on) => (on ? "下载完成后自动打包上传" : "只下载，完成后手动确认打包");
 
 function renderTools() {
   document.querySelectorAll("#tools [data-mode]").forEach((b) => b.classList.toggle("on", b.dataset.mode === state.draw.mode));
@@ -730,7 +762,7 @@ function renderDispatchState() {
   btn.disabled = !!busy || !state.draft || !valid || !name || !proxyOk;
   btn.title = busy || (!state.draft ? "先圈选区域" : !name ? "填写区域名称" : !valid ? "层级范围无效" : !proxyOk ? "填写上游代理地址" : "");
   rerunBtn.disabled = !!busy || !proxyOk;
-  rerunBtn.title = busy || "不改配置，按当前 conf.toml 重新下载并打包";
+  rerunBtn.title = busy || "不改配置，按当前 conf.toml 补齐缺失瓦片";
 }
 
 async function dispatchRegion() {
@@ -746,6 +778,7 @@ async function dispatchRegion() {
       <dt>层级</dt><dd>z${zmin} - z${zmax}${zmax > l.max ? `（tm.max 将从 ${l.max} 提到 ${zmax}）` : ""}</dd>
       <dt>估算</dt><dd>≤ ${n.toLocaleString()} 张瓦片</dd>
       <dt>代理</dt><dd>${esc(proxyLabel(proxy))}</dd>
+      <dt>打包</dt><dd>${packText(autoPack())}</dd>
     </dl>
     <p class="hint">会修改 ConfigMap ${esc(l.configMap)} 和 ${esc(l.geojsonConfigMap)}，然后创建 Job。${state.info.dryRun ? "<br>当前是演练模式，不会真正写入。" : ""}</p>`, "派发");
   if (!ok) return;
@@ -755,7 +788,7 @@ async function dispatchRegion() {
   try {
     const res = await api(`/api/layers/${encodeURIComponent(l.id)}/regions`, {
       method: "POST", auth: true,
-      body: { name, min: zmin, max: zmax, geojson: state.draft, proxy },
+      body: { name, min: zmin, max: zmax, geojson: state.draft, proxy, autoPack: autoPack() },
     });
     toast(res.dryRun ? `演练通过：将创建 ${res.job}` : `已派发 ${res.job}`);
     setDraft(null);
@@ -771,17 +804,39 @@ async function dispatchRegion() {
 async function rerun() {
   const l = currentLayer();
   const proxy = proxyPayload();
-  const ok = await confirmDialog("重新执行", `
+  const ok = await confirmDialog("重新下载", `
     <dl class="summary">
       <dt>图层</dt><dd>${esc(l.title)}（${esc(l.tileName)}）</dd>
       <dt>配置</dt><dd>${esc(l.configMap)}，${l.lrsCount} 段 lrs，z${l.min}-${l.max}</dd>
       <dt>代理</dt><dd>${esc(proxyLabel(proxy))}</dd>
+      <dt>打包</dt><dd>${packText(autoPack())}</dd>
     </dl>
-    <p class="hint">不修改配置。已有瓦片会跳过，补齐缺失后重新打包上传。</p>`, "执行");
+    <p class="hint">不修改配置。已有瓦片会跳过，只补齐缺失的。</p>`, "下载");
   if (!ok) return;
   try {
-    const res = await api(`/api/layers/${encodeURIComponent(l.id)}/jobs`, { method: "POST", auth: true, body: { proxy } });
+    const res = await api(`/api/layers/${encodeURIComponent(l.id)}/jobs`, { method: "POST", auth: true, body: { proxy, autoPack: autoPack() } });
     toast(res.dryRun ? `演练通过：将创建 ${res.job}` : `已派发 ${res.job}`);
+    await afterDispatch(res);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function packLayer() {
+  const l = currentLayer();
+  if (!l) return;
+  const busy = busyReason();
+  if (busy) { toast(busy, true); return; }
+  const ok = await confirmDialog("打包上传", `
+    <dl class="summary">
+      <dt>图层</dt><dd>${esc(l.title)}（目录 ${esc(l.tileName)}）</dd>
+      ${l.pendingPack ? `<dt>下载</dt><dd>${esc(l.pendingPack.job)} · ${fmtTime(l.pendingPack.since)} 完成</dd>` : ""}
+      <dt>目标</dt><dd>${esc(l.pmtilesKey)}</dd>
+      <dt>线上</dt><dd>${l.pmtiles ? fmtSize(l.pmtiles.size) + " · " + fmtTime(l.pmtiles.modified) : "尚未生成"}</dd>
+    </dl>
+    <p class="hint">会把整个目录（不只是新区域）重新打包成 pmtiles，并覆盖 MinIO 上的同名文件。目录大时耗时较长（GB 级约 1 小时），期间该目录不能再派发任务。${state.info.dryRun ? "<br>当前是演练模式，不会真正执行。" : ""}</p>`, "打包上传");
+  if (!ok) return;
+  try {
+    const res = await api(`/api/layers/${encodeURIComponent(l.id)}/pack`, { method: "POST", auth: true });
+    toast(res.dryRun ? `演练通过：将创建 ${res.job}` : `已派发打包 ${res.job}`);
     await afterDispatch(res);
   } catch (e) { toast(e.message, true); }
 }
@@ -804,13 +859,14 @@ function renderJobs() {
   const items = state.jobs.map((j) => `
     <div class="job-item ${state.activeJob === j.name ? "active" : ""}" data-name="${esc(j.name)}">
       <div class="job-top">
-        <span class="job-name"><span class="dot ${j.phase}"></span>${esc(j.name)}</span>
+        <span class="job-name"><span class="dot ${j.phase}"></span>${j.kind ? `<span class="tag">${KIND_TEXT[j.kind] || j.kind}</span>` : ""}${esc(j.name)}</span>
         <span class="job-time">${fmtAgo(j.created)}</span>
       </div>
       <div class="job-meta">${PHASE_TEXT[j.phase] || j.phase}${j.started ? " · 用时 " + fmtDur(j.started, j.completed) : ""}${j.managed ? "" : " · 旧 Job"}</div>
       ${j.reason ? `<div class="job-meta">${esc(j.reason)}</div>` : ""}
       ${j.proxy ? `<div class="job-meta muted">代理：${esc(j.proxy)}</div>` : ""}
       ${j.message && j.phase === "Failed" ? `<div class="job-meta" style="color:var(--danger)">${esc(j.message)}</div>` : ""}
+      ${pendingJob() === j.name ? `<div class="job-ops"><button class="btn small primary" type="button" data-pack>打包上传</button><span class="hint" style="margin:0">这次下载还没打包</span></div>` : ""}
       <div class="job-containers" data-containers></div>
     </div>`).join("");
   body.innerHTML = `
@@ -823,8 +879,11 @@ function renderJobs() {
     </div>`;
   $("#legacy-toggle").addEventListener("change", (e) => { state.showLegacy = e.target.checked; loadJobs(); });
   body.querySelectorAll(".job-item").forEach((el) => el.addEventListener("click", () => openJob(el.dataset.name)));
+  body.querySelectorAll("[data-pack]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); packLayer(); }));
   if (state.activeJob) refreshJobDetail();
 }
+
+const pendingJob = () => currentLayer()?.pendingPack?.job;
 
 const finished = (job) => job.phase === "Succeeded" || job.phase === "Failed";
 
@@ -841,9 +900,9 @@ async function refreshJobDetail() {
       ? pod.containers.map((c) => `<span class="cstate ${c.state}" title="${esc(c.detail || "")}">${esc(c.name)} ${STATE_TEXT[c.state] || c.state}${c.restarts ? " ↻" + c.restarts : ""}</span>`).join("")
       : `<span class="cstate">${finished(d.job) ? "Pod 已清理，日志不可用" : "Pod 尚未创建"}</span>`;
     const item = el.closest(".job-item");
-    if (d.job.managed && !item.querySelector(".job-ops")) {
+    if (d.job.managed && !item.querySelector(".job-ops.del")) {
       const ops = document.createElement("div");
-      ops.className = "job-ops";
+      ops.className = "job-ops del";
       ops.innerHTML = `<button class="btn small danger" type="button">${d.job.phase === "Running" || d.job.phase === "Pending" ? "终止并删除" : "删除"}</button>`;
       ops.querySelector("button").addEventListener("click", (e) => { e.stopPropagation(); deleteJob(name, d.job.phase); });
       item.appendChild(ops);

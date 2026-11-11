@@ -4,11 +4,16 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 INPUT_DIR="${INPUT_DIR:-/data/output}"
 
-echo "==> Waiting for download to finish..."
-while [ ! -f "$INPUT_DIR/.done" ]; do
-    sleep 10
-done
-echo "==> Download complete, starting sync"
+# 与下载容器并行启动时靠 .done 判断下载结束；单独打包（如 tiler-console 的打包 Job）设 WAIT_FOR_DONE=0 跳过
+if [ "${WAIT_FOR_DONE:-1}" = "1" ]; then
+    echo "==> Waiting for download to finish..."
+    while [ ! -f "$INPUT_DIR/.done" ]; do
+        sleep 10
+    done
+    echo "==> Download complete, starting sync"
+else
+    echo "==> WAIT_FOR_DONE=0, starting sync directly"
+fi
 MINIO_ENDPOINT="${MINIO_ENDPOINT:?MINIO_ENDPOINT is required}"
 MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}"
 MINIO_SECRET_KEY="${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}"

@@ -73,6 +73,7 @@ func main() {
 	mux.HandleFunc("GET /api/layers/{id}", s.handleLayer)
 	mux.HandleFunc("POST /api/layers/{id}/regions", s.auth(s.handleAddRegion))
 	mux.HandleFunc("POST /api/layers/{id}/jobs", s.auth(s.handleRerun))
+	mux.HandleFunc("POST /api/layers/{id}/pack", s.auth(s.handlePack))
 	mux.HandleFunc("GET /api/jobs", s.handleJobs)
 	mux.HandleFunc("GET /api/jobs/{name}", s.handleJob)
 	mux.HandleFunc("GET /api/jobs/{name}/logs", s.handleLogs)
@@ -163,18 +164,25 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 
 type layerState struct {
 	LayerEntry
-	TileName   string     `json:"tileName,omitempty"`
-	Format     string     `json:"format,omitempty"`
-	Min        int        `json:"min"`
-	Max        int        `json:"max"`
-	LrsCount   int        `json:"lrsCount"`
-	PMTilesKey string     `json:"pmtilesKey,omitempty"`
-	PMTiles    *objInfo   `json:"pmtiles,omitempty"`
-	LastJob    *jobBrief  `json:"lastJob,omitempty"`
-	SharedWith []string   `json:"sharedWith,omitempty"`
-	Error      string     `json:"error,omitempty"`
-	conf       *TilerConf `json:"-"`
-	raw        string     `json:"-"`
+	TileName    string       `json:"tileName,omitempty"`
+	Format      string       `json:"format,omitempty"`
+	Min         int          `json:"min"`
+	Max         int          `json:"max"`
+	LrsCount    int          `json:"lrsCount"`
+	PMTilesKey  string       `json:"pmtilesKey,omitempty"`
+	PMTiles     *objInfo     `json:"pmtiles,omitempty"`
+	LastJob     *jobBrief    `json:"lastJob,omitempty"`
+	PendingPack *pendingPack `json:"pendingPack,omitempty"`
+	SharedWith  []string     `json:"sharedWith,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	conf        *TilerConf   `json:"-"`
+	raw         string       `json:"-"`
+}
+
+// pendingPack 表示目录里有比当前 pmtiles 更新的下载结果，等待人工确认打包。
+type pendingPack struct {
+	Job   string    `json:"job"`
+	Since time.Time `json:"since"`
 }
 
 type objInfo struct {
@@ -251,9 +259,52 @@ func (s *Server) handleLayers(w http.ResponseWriter, r *http.Request) {
 				b := briefJob(j)
 				st.LastJob = &b
 			}
+			st.PendingPack = pendingFor(st, jobs)
 		}
 	}
 	writeJSON(w, 200, layers)
+}
+
+// pendingFor：同目录最近一次成功下载晚于最近一次成功打包（及 pmtiles 修改时间），即为待打包。
+// 下载 Job 过了 TTL 被清理后，这个提示也随之消失。
+func pendingFor(st *layerState, jobs []Job) *pendingPack {
+	if st.TileName == "" {
+		return nil
+	}
+	dir := tileNameLabel(st.TileName)
+	var lastDL *Job
+	var lastPack time.Time
+	if st.PMTiles != nil {
+		lastPack = st.PMTiles.Modified
+	}
+	for i := range jobs {
+		j := &jobs[i]
+		if j.Metadata.Labels[labelTileName] != dir || j.Phase() != "Succeeded" || j.Status.CompletionTime == nil {
+			continue
+		}
+		done := *j.Status.CompletionTime
+		switch jobKind(j) {
+		case KindDownload:
+			if lastDL == nil || done.After(*lastDL.Status.CompletionTime) {
+				lastDL = j
+			}
+		default:
+			if done.After(lastPack) {
+				lastPack = done
+			}
+		}
+	}
+	if lastDL == nil || !lastDL.Status.CompletionTime.After(lastPack) {
+		return nil
+	}
+	return &pendingPack{Job: lastDL.Metadata.Name, Since: *lastDL.Status.CompletionTime}
+}
+
+func jobKind(j *Job) string {
+	if k := j.Metadata.Labels[labelKind]; k != "" {
+		return k
+	}
+	return KindAll
 }
 
 var tkParam = regexp.MustCompile(`((?:tk|key|access_token)=)[^&"\s]+`)
@@ -299,11 +350,12 @@ func (s *Server) handleLayer(w http.ResponseWriter, r *http.Request) {
 }
 
 type addRegionReq struct {
-	Proxy   ProxyOpt        `json:"proxy"`
-	Name    string          `json:"name"`
-	Min     int             `json:"min"`
-	Max     int             `json:"max"`
-	Geojson json.RawMessage `json:"geojson"`
+	Proxy    ProxyOpt        `json:"proxy"`
+	AutoPack bool            `json:"autoPack"`
+	Name     string          `json:"name"`
+	Min      int             `json:"min"`
+	Max      int             `json:"max"`
+	Geojson  json.RawMessage `json:"geojson"`
 }
 
 func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
@@ -392,10 +444,11 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, fmt.Errorf("geojson %s 已写入，但更新 conf.toml 失败: %w", key, err))
 		return
 	}
-	jn := jobName(l.ID, now)
+	kind := downloadKind(req.AutoPack)
+	jn := jobName(l.ID, kind, now)
 	reason := fmt.Sprintf("新增区域 %s（%d-%d 级）", name, req.Min, req.Max)
-	if _, err := s.kube.CreateJob(buildJob(s.reg, l, parsed, jn, reason, proxy)); err != nil {
-		writeErr(w, 500, fmt.Errorf("区域已写入配置，但创建 Job 失败（可在页面点「重新执行」）: %w", err))
+	if _, err := s.kube.CreateJob(buildJob(s.reg, l, parsed, jn, reason, kind, proxy)); err != nil {
+		writeErr(w, 500, fmt.Errorf("区域已写入配置，但创建 Job 失败（可在页面点「重新下载」）: %w", err))
 		return
 	}
 	log.Printf("派发 %s：图层 %s %s", jn, l.ID, reason)
@@ -409,7 +462,8 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Proxy ProxyOpt `json:"proxy"`
+		Proxy    ProxyOpt `json:"proxy"`
+		AutoPack bool     `json:"autoPack"`
 	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil && err != io.EOF {
@@ -433,12 +487,48 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, err)
 		return
 	}
-	jn := jobName(l.ID, time.Now())
-	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, "按当前配置重新执行", proxy)); err != nil {
+	kind := downloadKind(req.AutoPack)
+	jn := jobName(l.ID, kind, time.Now())
+	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, "按当前配置重新下载", kind, proxy)); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	log.Printf("派发 %s：图层 %s 重新执行", jn, l.ID)
+	log.Printf("派发 %s：图层 %s 重新下载", jn, l.ID)
+	writeJSON(w, 201, map[string]any{"job": jn, "dryRun": s.kube.dryRun})
+}
+
+func downloadKind(autoPack bool) string {
+	if autoPack {
+		return KindAll
+	}
+	return KindDownload
+}
+
+// handlePack 人工确认后打包：把整个目录打成 pmtiles，覆盖 MinIO 上的同名文件。
+func (s *Server) handlePack(w http.ResponseWriter, r *http.Request) {
+	l, ok := s.reg.layer(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 404, errors.New("图层不存在"))
+		return
+	}
+	s.dispatch.Lock()
+	defer s.dispatch.Unlock()
+	st := s.loadLayer(r.Context(), l, false)
+	if st.conf == nil {
+		writeErr(w, 500, errors.New(st.Error))
+		return
+	}
+	if err := s.ensureIdle(st.TileName); err != nil {
+		writeErr(w, 409, err)
+		return
+	}
+	jn := jobName(l.ID, KindPack, time.Now())
+	reason := "打包上传 " + st.PMTilesKey
+	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, reason, KindPack, ProxyOpt{Mode: "direct"})); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	log.Printf("派发 %s：图层 %s 打包上传", jn, l.ID)
 	writeJSON(w, 201, map[string]any{"job": jn, "dryRun": s.kube.dryRun})
 }
 
@@ -462,6 +552,7 @@ type jobBrief struct {
 	Name      string     `json:"name"`
 	Layer     string     `json:"layer,omitempty"`
 	Managed   bool       `json:"managed"`
+	Kind      string     `json:"kind,omitempty"`
 	Phase     string     `json:"phase"`
 	Reason    string     `json:"reason,omitempty"`
 	Proxy     string     `json:"proxy,omitempty"`
@@ -489,6 +580,9 @@ func briefJob(j *Job) jobBrief {
 		Created:   j.Metadata.CreationTimestamp,
 		Started:   j.Status.StartTime,
 		Completed: j.Status.CompletionTime,
+	}
+	if b.Managed {
+		b.Kind = jobKind(j)
 	}
 	for _, c := range j.Status.Conditions {
 		if c.Status == "True" && c.Message != "" {
