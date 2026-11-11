@@ -50,11 +50,22 @@ delete_from_pool() {
     curl -sf --max-time 3 "${POOL_API}/delete/?proxy=$1" >/dev/null 2>&1 || true
 }
 
-test_proxy_direct() {
-    curl -sf --proxy "http://$1" \
-         --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-         -o /dev/null -H "User-Agent: $UA" -H "Referer: $REFERER" "$TEST_URL" 2>/dev/null
-}
+# probe.sh <代理地址>：经该代理请求测试瓦片，状态 200 且 Content-Type 为 image/* 才算可用。
+# 只看状态码不够：有的免费代理对任何请求都回 200 加一小段 HTML，tiler 校验全失败却不会切换。
+# 写成独立脚本，供下面 xargs 并行测试的子 shell 调用；放容器本地，不放多个 Job 共用的 /tmp/proxy。
+PROBE=/tmp/probe.sh
+export TEST_URL UA REFERER CONNECT_TIMEOUT MAX_TIME
+cat > "$PROBE" <<'EOF'
+#!/bin/sh
+r=$(curl -s --proxy "$1" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+      -o /dev/null -w '%{http_code} %{content_type}' \
+      -H "User-Agent: $UA" -H "Referer: $REFERER" "$TEST_URL" 2>/dev/null) || exit 1
+case "$r" in
+    "200 image/"*) exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$PROBE"
 
 get_proxy() {
     local candidates="/tmp/proxy/candidates.txt"
@@ -86,13 +97,8 @@ get_proxy() {
 
         # Parallel test: first one to succeed wins
         cat "$candidates" | xargs -P "$count" -I{} sh -c '
-            if curl -sf --proxy "http://{}" \
-                   --connect-timeout '"$CONNECT_TIMEOUT"' --max-time '"$MAX_TIME"' \
-                   -o /dev/null -H "User-Agent: '"$UA"'" -H "Referer: '"$REFERER"'" \
-                   "'"$TEST_URL"'" 2>/dev/null; then
-                echo "{}" >> "'"$winner"'"
-            fi
-        ' 2>/dev/null || true
+            if "$1" "http://$2"; then echo "$2" >> "$3"; fi
+        ' _ "$PROBE" {} "$winner" 2>/dev/null || true
 
         if [ -s "$winner" ]; then
             local result
@@ -152,9 +158,7 @@ start_gost() {
 }
 
 health_check() {
-    curl -sf --proxy "http://localhost:${PORT}" \
-         --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-         -o /dev/null -H "User-Agent: $UA" -H "Referer: $REFERER" "$TEST_URL" 2>/dev/null
+    "$PROBE" "http://localhost:${PORT}"
 }
 
 switch_proxy() {
