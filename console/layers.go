@@ -328,7 +328,8 @@ var kindShort = map[string]string{KindDownload: "dl", KindPack: "pk", KindAll: "
 //   - all：download 为普通 initContainer，结束后 sync 才启动。
 //
 // sync 一律设 WAIT_FOR_DONE=0：顺序由容器编排保证，不依赖输出目录里残留的 .done。
-func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason, kind string, proxy ProxyOpt) map[string]any {
+// packMeta 是 packMetadata 的结果，交给 sync 在目录缺 metadata.json 时补进 pmtiles；为空则不设。
+func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason, kind string, proxy ProxyOpt, packMeta string) map[string]any {
 	outputDir := conf.Output.Directory
 	if outputDir == "" {
 		outputDir = "/data/output"
@@ -404,22 +405,26 @@ func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason, kind st
 	}
 
 	if kind == KindPack || kind == KindAll {
+		syncEnv := []any{
+			map[string]any{"name": "WAIT_FOR_DONE", "value": "0"},
+			map[string]any{"name": "INPUT_DIR", "value": outputDir},
+			map[string]any{"name": "TILE_NAME", "value": conf.TM.Name},
+			map[string]any{"name": "MINIO_PATH", "value": l.MinioPath},
+			envFromCM("MINIO_ENDPOINT", r.MinioConfigMap, "MINIO_ENDPOINT", false),
+			envFromCM("MINIO_BUCKET", r.MinioConfigMap, "MINIO_BUCKET", false),
+			envFromCM("MINIO_ACCESS_KEY", r.MinioConfigMap, "MINIO_ACCESS_KEY", false),
+			map[string]any{"name": "MINIO_SECRET_KEY", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": r.MinioSecret, "key": "MINIO_SECRET_KEY"}}},
+		}
+		if packMeta != "" {
+			syncEnv = append(syncEnv, map[string]any{"name": "TILE_METADATA", "value": packMeta})
+		}
 		containers = append(containers, map[string]any{
 			"name":            "sync",
 			"image":           r.Images.Sync,
 			"imagePullPolicy": "Always",
-			"env": []any{
-				map[string]any{"name": "WAIT_FOR_DONE", "value": "0"},
-				map[string]any{"name": "INPUT_DIR", "value": outputDir},
-				map[string]any{"name": "TILE_NAME", "value": conf.TM.Name},
-				map[string]any{"name": "MINIO_PATH", "value": l.MinioPath},
-				envFromCM("MINIO_ENDPOINT", r.MinioConfigMap, "MINIO_ENDPOINT", false),
-				envFromCM("MINIO_BUCKET", r.MinioConfigMap, "MINIO_BUCKET", false),
-				envFromCM("MINIO_ACCESS_KEY", r.MinioConfigMap, "MINIO_ACCESS_KEY", false),
-				map[string]any{"name": "MINIO_SECRET_KEY", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": r.MinioSecret, "key": "MINIO_SECRET_KEY"}}},
-			},
-			"volumeMounts": []any{map[string]any{"name": "output", "mountPath": outputDir, "readOnly": true}},
-			"resources":    resources("500m", "512Mi", "2", "2Gi"),
+			"env":             syncEnv,
+			"volumeMounts":    []any{map[string]any{"name": "output", "mountPath": outputDir, "readOnly": true}},
+			"resources":       resources("500m", "512Mi", "2", "2Gi"),
 		})
 	}
 

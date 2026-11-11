@@ -26,7 +26,7 @@ func TestBuildJobOrdersProxyDownloadSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	l := &LayerEntry{ID: "tianditu-vector", ConfigMap: "cfg", GeojsonConfigMap: "geo", MinioPath: "map/tianditu", Proxy: true}
-	job := buildJob(testRegistry(), l, conf, "tc-x", "test", KindAll, ProxyOpt{Mode: "default"})
+	job := buildJob(testRegistry(), l, conf, "tc-x", "test", KindAll, ProxyOpt{Mode: "default"}, "")
 
 	b, _ := json.Marshal(job)
 	var parsed struct {
@@ -79,7 +79,7 @@ func TestBuildJobWithoutProxy(t *testing.T) {
 	if err != nil || p.Mode != "direct" {
 		t.Fatalf("未开代理的图层默认应直连: %+v %v", p, err)
 	}
-	b, _ := json.Marshal(buildJob(testRegistry(), l, conf, "tc-x", "", KindAll, p))
+	b, _ := json.Marshal(buildJob(testRegistry(), l, conf, "tc-x", "", KindAll, p, ""))
 	if strings.Contains(string(b), `"proxy"`) || strings.Contains(string(b), "HTTP_PROXY") {
 		t.Fatalf("不需要代理的图层不应带 proxy: %s", b)
 	}
@@ -132,7 +132,7 @@ func TestProxyModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p))
+	b, _ := json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
 	js := string(b)
 	if !strings.Contains(js, `"UPSTREAM_PROXY","value":"socks5://user:pw@10.0.0.1:1080"`) || strings.Contains(js, "PROXY_POOL_API") {
 		t.Fatalf("upstream env 不对: %s", js)
@@ -145,13 +145,13 @@ func TestProxyModes(t *testing.T) {
 	}
 
 	p, _ = ProxyOpt{Mode: "pool", URL: "http://pool:5010"}.resolve(l, r)
-	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p))
+	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
 	if !strings.Contains(string(b), `"PROXY_POOL_API","value":"http://pool:5010"`) {
 		t.Fatalf("pool env 不对: %s", b)
 	}
 
 	p, _ = ProxyOpt{Mode: "direct"}.resolve(l, r)
-	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p))
+	b, _ = json.Marshal(buildJob(r, l, conf, "tc-x", "", KindAll, p, ""))
 	if strings.Contains(string(b), "HTTP_PROXY") {
 		t.Fatalf("直连不应设 HTTP_PROXY: %s", b)
 	}
@@ -214,22 +214,25 @@ func TestBuildJobKinds(t *testing.T) {
 	r := testRegistry()
 	l := &LayerEntry{ID: "a", ConfigMap: "cfg", GeojsonConfigMap: "geo", MinioPath: "map/x", Proxy: true}
 
-	inits, mains, _, _ := shapeOf(t, buildJob(r, l, conf, "n", "", KindDownload, ProxyOpt{Mode: "default"}))
+	inits, mains, _, _ := shapeOf(t, buildJob(r, l, conf, "n", "", KindDownload, ProxyOpt{Mode: "default"}, ""))
 	if strings.Join(inits, ",") != "proxy" || strings.Join(mains, ",") != "download" {
 		t.Fatalf("download job: init=%v main=%v", inits, mains)
 	}
 
-	inits, mains, vols, env := shapeOf(t, buildJob(r, l, conf, "n", "", KindPack, ProxyOpt{Mode: "direct"}))
+	inits, mains, vols, env := shapeOf(t, buildJob(r, l, conf, "n", "", KindPack, ProxyOpt{Mode: "direct"}, `{"name":"vector"}`))
 	if len(inits) != 0 || strings.Join(mains, ",") != "sync" || strings.Join(vols, ",") != "output" {
 		t.Fatalf("pack job: init=%v main=%v vols=%v", inits, mains, vols)
 	}
-	if env["sync.WAIT_FOR_DONE"] != "0" || env["sync.TILE_NAME"] != "vector" {
+	if env["sync.WAIT_FOR_DONE"] != "0" || env["sync.TILE_NAME"] != "vector" || env["sync.TILE_METADATA"] != `{"name":"vector"}` {
 		t.Fatalf("pack env = %v", env)
 	}
 
-	inits, mains, _, _ = shapeOf(t, buildJob(r, l, conf, "n", "", KindAll, ProxyOpt{Mode: "direct"}))
+	inits, mains, _, env = shapeOf(t, buildJob(r, l, conf, "n", "", KindAll, ProxyOpt{Mode: "direct"}, ""))
 	if strings.Join(inits, ",") != "download" || strings.Join(mains, ",") != "sync" {
 		t.Fatalf("all job direct: init=%v main=%v", inits, mains)
+	}
+	if _, ok := env["sync.TILE_METADATA"]; ok {
+		t.Fatal("没有元数据时不应设 TILE_METADATA")
 	}
 }
 

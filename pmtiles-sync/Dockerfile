@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir mbutil
 COPY --from=go-builder /go/bin/go-pmtiles /usr/local/bin/pmtiles
 COPY --from=go-builder /go/bin/mc /usr/local/bin/mc
 
-COPY sync.sh detect-format.sh drop-empty-tiles.sh /app/
-RUN chmod +x /app/sync.sh /app/detect-format.sh /app/drop-empty-tiles.sh
+COPY sync.sh detect-format.sh drop-empty-tiles.sh apply-metadata.sh /app/
+RUN chmod +x /app/sync.sh /app/detect-format.sh /app/drop-empty-tiles.sh /app/apply-metadata.sh
 
 ENTRYPOINT ["/app/sync.sh"]

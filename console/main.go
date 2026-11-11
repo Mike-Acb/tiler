@@ -478,7 +478,11 @@ func (s *Server) handleAddRegion(w http.ResponseWriter, r *http.Request) {
 	kind := downloadKind(req.AutoPack)
 	jn := jobName(l.ID, kind, now)
 	reason := fmt.Sprintf("新增区域 %s（%d-%d 级）", name, req.Min, req.Max)
-	if _, err := s.kube.CreateJob(buildJob(s.reg, l, parsed, jn, reason, kind, proxy)); err != nil {
+	meta := ""
+	if kind == KindAll {
+		meta = packMetadata(parsed, gcm.Data)
+	}
+	if _, err := s.kube.CreateJob(buildJob(s.reg, l, parsed, jn, reason, kind, proxy, meta)); err != nil {
 		writeErr(w, 500, fmt.Errorf("区域已写入配置，但创建 Job 失败（可在页面点「重新下载」）: %w", err))
 		return
 	}
@@ -524,7 +528,11 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := downloadKind(req.AutoPack)
 	jn := jobName(l.ID, kind, time.Now())
-	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, "按当前配置重新下载", kind, proxy)); err != nil {
+	meta := ""
+	if kind == KindAll {
+		meta = s.packMetaFor(l, st.conf)
+	}
+	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, "按当前配置重新下载", kind, proxy, meta)); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
@@ -563,7 +571,7 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request) {
 	}
 	jn := jobName(l.ID, KindPack, time.Now())
 	reason := "打包上传 " + st.PMTilesKey
-	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, reason, KindPack, ProxyOpt{Mode: "direct"})); err != nil {
+	if _, err := s.kube.CreateJob(buildJob(s.reg, l, st.conf, jn, reason, KindPack, ProxyOpt{Mode: "direct"}, s.packMetaFor(l, st.conf))); err != nil {
 		writeErr(w, 500, err)
 		return
 	}

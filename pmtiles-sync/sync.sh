@@ -53,6 +53,12 @@ process_dir() {
     echo "    Removing empty tiles (404 markers) from MBTiles..."
     "$SCRIPT_DIR/drop-empty-tiles.sh" "$mbtiles_file"
 
+    # 目录里有 metadata.json 时 mb-util 已导入；没有（旧版 tiler 下载的）就用控制台传来的元数据补上
+    if [ ! -f "$tiledir/metadata.json" ] && [ -n "${TILE_METADATA:-}" ]; then
+        echo "    No metadata.json, applying TILE_METADATA..."
+        "$SCRIPT_DIR/apply-metadata.sh" "$mbtiles_file"
+    fi
+
     echo "    Converting to PMTiles..."
     pmtiles convert "$mbtiles_file" "$pmtiles_file"
 
