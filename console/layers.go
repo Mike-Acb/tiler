@@ -426,7 +426,8 @@ func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason, kind st
 				"restartPolicy":   "Always",
 				"env":             proxyEnv,
 				"volumeMounts":    []any{map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"}},
-				"resources":       resources("100m", "64Mi", "500m", "128Mi"),
+				// 多代理模式下每个上游一个 gost 进程（各约 16MB），10 个代理时 128Mi 会被 OOM
+				"resources": resources("100m", "128Mi", "1", "512Mi"),
 			})
 			downloadEnv = []any{
 				map[string]any{"name": "HTTP_PROXY", "value": "http://localhost:8080"},

@@ -33,6 +33,9 @@ fi
 BLACKLIST="/tmp/proxy/blacklist.txt"
 SWITCH_TRIGGER="/tmp/proxy/switch"
 BASE_PORT=$((PORT + 1)) # 各上游代理槽位的本地端口：8081、8082……
+FRONT_PID=""
+# 多代理时一个上游一个 gost 进程，让 Go 早点回收内存，单进程占用更小
+export GOGC="${GOGC:-50}"
 
 log() { echo "[proxy] $*" >&2; }
 
@@ -291,6 +294,7 @@ start_front() {
     # 某个槽位连不上（正在换、已置空）时，前端 10 秒内不再选它
     gost -L "http://:${PORT}" \
         -F "http://127.0.0.1:${BASE_PORT}?ip=${ips}&strategy=round&max_fails=1&fail_timeout=10s" &
+    FRONT_PID=$!
 }
 
 monitor() {
@@ -300,6 +304,12 @@ monitor() {
     while true; do
         sleep 3
         tick=$((tick + 1))
+
+        # 前端 gost 挂了（如被 OOM 杀掉）tiler 就全部连不上，立刻拉起
+        if ! kill -0 "$FRONT_PID" 2>/dev/null; then
+            log "WARN: front gost exited, restarting"
+            start_front
+        fi
 
         # tiler 报告代理出错（每 3 秒看一次）：马上探测各槽位
         if [ -f "$SWITCH_TRIGGER" ]; then
