@@ -437,11 +437,14 @@ func (task *Task) downloadLayer(layer Layer) {
 
 	go tilecover.CollectionChannel(layer.Collection, maptile.Zoom(layer.Zoom), tilelist)
 
+	var existing *tileIndex
+	if task.outformat != "mbtiles" {
+		existing = newTileIndex(task.File, layer.Zoom, string(task.TileMap.Format))
+	}
 	for tile := range tilelist {
 		// 文件模式下，已存在的 tile 直接跳过，不走 sleep 和 worker
-		if task.outformat != "mbtiles" {
-			filePath := filepath.Join(task.File, fmt.Sprintf(`%d`, tile.Z), fmt.Sprintf(`%d`, tile.X), fmt.Sprintf(`%d.%s`, tile.Y, task.TileMap.Format))
-			if _, err := os.Stat(filePath); err == nil {
+		if existing != nil {
+			if existing.has(tile.X, tile.Y) {
 				log.Debugf("tile(z:%d, x:%d, y:%d) 已存在，跳过", tile.Z, tile.X, tile.Y)
 				bar.Increment()
 				task.Bar.Increment()
