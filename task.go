@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/paulmach/orb"
@@ -268,15 +269,19 @@ func fetchTile(tileURL string) ([]byte, error) {
 	req.Header.Set("Referer", "https://map.tianditu.gov.cn")
 	resp, err := client.Do(req)
 	if err != nil {
+		if usingProxy() { // 连不上代理、代理连不上上游、超时：多半是代理过期了
+			triggerProxySwitch("请求失败")
+			return nil, fmt.Errorf("%w: 发送请求失败: %v", errProxy, err)
+		}
 		return nil, fmt.Errorf("发送请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 404 {
 		return nil, errNotFound
 	}
-	if resp.StatusCode == 418 {
-		triggerProxySwitch()
-		return nil, fmt.Errorf("状态码: 418 (IP被封禁，已触发切换代理)")
+	if usingProxy() && isProxyStatus(resp.StatusCode) {
+		triggerProxySwitch(strconv.Itoa(resp.StatusCode))
+		return nil, fmt.Errorf("%w: 状态码 %d", errProxy, resp.StatusCode)
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("状态码: %d", resp.StatusCode)
@@ -289,6 +294,16 @@ func fetchTile(tileURL string) ([]byte, error) {
 		return nil, nil
 	}
 	return body, nil
+}
+
+// isProxyStatus 判断走代理时的响应码是否说明代理出了问题：
+// 407 认证失效（短效代理到期）、418 IP 被天地图封、502/503/504 代理连不上上游。
+func isProxyStatus(code int) bool {
+	switch code {
+	case 407, 418, 502, 503, 504:
+		return true
+	}
+	return false
 }
 
 func validateTileData(format string, body []byte) error {
@@ -320,25 +335,39 @@ func validateTileData(format string, body []byte) error {
 }
 
 var errNotFound = errors.New("404")
-var proxySwitchOnce sync.Once
 
-func triggerProxySwitch() {
-	proxySwitchOnce.Do(func() {
-		path := "/tmp/proxy/switch"
-		if err := os.WriteFile(path, []byte("418"), 0644); err != nil {
-			log.Warnf("触发代理切换失败: %s", err)
-			return
-		}
-		log.Warn("已触发代理切换 (418)")
-		go func() {
-			time.Sleep(10 * time.Second)
-			proxySwitchOnce = sync.Once{}
-		}()
-	})
+// lastProxySwitch 是上次通知换代理的时间（UnixNano），用来做 10 秒内只通知一次。
+var lastProxySwitch atomic.Int64
+
+// proxySwitchPath 是与代理边车共享的切换通知文件（测试里改到临时目录）。
+var proxySwitchPath = "/tmp/proxy/switch"
+
+// errProxy 表示请求坏在代理上（代理过期、认证失效、被封），换代理后重试即可。
+var errProxy = errors.New("代理不可用")
+
+// maxProxyRetries 是单张瓦片因代理失败而重试的次数；短效代理约 1 分钟一换，换的间隙会有少量请求失败。
+const maxProxyRetries = 5
+
+func usingProxy() bool {
+	return os.Getenv("HTTP_PROXY") != "" || os.Getenv("HTTPS_PROXY") != ""
+}
+
+// triggerProxySwitch 通知代理边车立即换代理（边车每 3 秒检查一次 /tmp/proxy/switch）；10 秒内只触发一次。
+func triggerProxySwitch(reason string) {
+	now := time.Now().UnixNano()
+	last := lastProxySwitch.Load()
+	if now-last < int64(10*time.Second) || !lastProxySwitch.CompareAndSwap(last, now) {
+		return
+	}
+	if err := os.WriteFile(proxySwitchPath, []byte(reason), 0644); err != nil {
+		log.Warnf("触发代理切换失败: %s", err)
+		return
+	}
+	log.Warnf("已触发代理切换 (%s)", reason)
 }
 
 func proxyReady() bool {
-	if os.Getenv("HTTP_PROXY") == "" && os.Getenv("HTTPS_PROXY") == "" {
+	if !usingProxy() {
 		return true
 	}
 	_, err := os.Stat("/tmp/proxy/ready")
@@ -376,8 +405,17 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	}
 	tileURL := prep(mt, url)
 
-	waitForProxy()
-	body, err := fetchTile(tileURL)
+	var body []byte
+	var err error
+	for attempt := 0; ; attempt++ {
+		waitForProxy()
+		body, err = fetchTile(tileURL)
+		if !errors.Is(err, errProxy) || attempt >= maxProxyRetries {
+			break
+		}
+		// 给边车时间收到切换通知、摘掉 ready，waitForProxy 再等新代理就绪
+		time.Sleep(3 * time.Second)
+	}
 	if errors.Is(err, errNotFound) {
 		log.Debugf("nil tile %v (404)", mt)
 		if task.outformat != "mbtiles" {

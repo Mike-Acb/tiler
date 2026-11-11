@@ -16,11 +16,16 @@ AUTH_PREFIX="${PROXY_AUTH:+${PROXY_AUTH}@}"
 # 如青果 https://share.proxy.qg.net/get?key=...&num=1&format=txt；否则按 jhao104/proxy_pool 的 /get/ /delete/ /count/。
 case "$POOL_API" in *\?*) FETCH_MODE=1 ;; *) FETCH_MODE=0 ;; esac
 POOL_SHOWN="${POOL_API%%\?*}" # 日志里不打印查询参数（含 key）
+# PROXY_MAX_AGE：代理用满这么多秒就提前换（0 不换）。提取链接多是约 1 分钟的短效代理，默认 50 秒；代理池默认不换。
+if [ -z "${PROXY_MAX_AGE:-}" ]; then
+    if [ "$FETCH_MODE" = 1 ]; then PROXY_MAX_AGE=50; else PROXY_MAX_AGE=0; fi
+fi
 
 BLACKLIST="/tmp/proxy/blacklist.txt"
 SWITCH_TRIGGER="/tmp/proxy/switch"
 GOST_PID=""
 CURRENT_PROXY=""
+STARTED_AT=0
 
 log() { echo "[proxy] $*" >&2; }
 
@@ -170,6 +175,7 @@ start_gost() {
         wait "$GOST_PID" 2>/dev/null || true
     fi
     CURRENT_PROXY="$1"
+    STARTED_AT=$(date +%s)
     log "using proxy: $CURRENT_PROXY"
     gost -L "http://:${PORT}" -F "http://${AUTH_PREFIX}${CURRENT_PROXY}" &
     GOST_PID=$!
@@ -181,8 +187,22 @@ health_check() {
     "$PROBE" "http://localhost:${PORT}"
 }
 
+# rotate_proxy：当前代理快到期时提前换。先拿到可用的新代理再切过去，拿不到就继续用当前的，15 秒后再试。
+rotate_proxy() {
+    log "rotating (used ${PROXY_MAX_AGE}s): $CURRENT_PROXY"
+    blacklist_add "$CURRENT_PROXY" # 免得提取链接又返回同一个
+    local new_proxy
+    if new_proxy=$(get_proxy); then
+        start_gost "$new_proxy"
+    else
+        log "WARN: rotate failed, keep current for now"
+        STARTED_AT=$((STARTED_AT + 15))
+    fi
+}
+
 switch_proxy() {
     log "switching from: $CURRENT_PROXY"
+    mark_unready # 当前代理已坏：立刻让 tiler 暂停发请求，等新代理就绪
     blacklist_add "$CURRENT_PROXY"
     delete_from_pool "$CURRENT_PROXY"
     local new_proxy wait_s=30
@@ -205,9 +225,22 @@ monitor() {
 
         # 418 trigger from tiler (check every 3s)
         if [ -f "$SWITCH_TRIGGER" ]; then
+            log "switch trigger from tiler: $(cat "$SWITCH_TRIGGER" 2>/dev/null)"
             rm -f "$SWITCH_TRIGGER"
-            log "418 trigger received from tiler"
+            # 刚换完代理时，旧 gost 上被中断的请求也会报错触发切换，这几秒内的通知忽略，免得把新代理换掉
+            if [ $(( $(date +%s) - STARTED_AT )) -lt 8 ]; then
+                log "ignored: proxy just switched"
+                continue
+            fi
             switch_proxy || true
+            fail_count=0
+            tick=0
+            continue
+        fi
+
+        # 短效代理到期前主动换
+        if [ "$PROXY_MAX_AGE" -gt 0 ] && [ $(( $(date +%s) - STARTED_AT )) -ge "$PROXY_MAX_AGE" ]; then
+            rotate_proxy || true
             fail_count=0
             tick=0
             continue
@@ -232,7 +265,7 @@ monitor() {
 }
 
 # ── main ──
-log "config: timeout=${CONNECT_TIMEOUT}/${MAX_TIME}s, health=${HEALTH_INTERVAL}s, batch=${PRE_TEST_BATCH}"
+log "config: timeout=${CONNECT_TIMEOUT}/${MAX_TIME}s, health=${HEALTH_INTERVAL}s, batch=${PRE_TEST_BATCH}, max_age=${PROXY_MAX_AGE}s"
 log "test url: $TEST_URL"
 wait_for_pool || { log "proxy_pool not reachable, exiting"; exit 1; }
 
