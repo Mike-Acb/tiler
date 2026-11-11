@@ -1,0 +1,426 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/url"
+	"os"
+	"path"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// Registry 描述控制台管理的图层，以及生成 Job 用到的集群资源名。
+type Registry struct {
+	Namespace        string            `json:"namespace"`
+	Images           Images            `json:"images"`
+	OutputPVC        string            `json:"outputPVC"`
+	ProxyConfigMap   string            `json:"proxyConfigMap"`
+	MinioConfigMap   string            `json:"minioConfigMap"`
+	MinioSecret      string            `json:"minioSecret"`
+	GeojsonMountPath string            `json:"geojsonMountPath"`
+	JobTTLSeconds    int               `json:"jobTTLSeconds"`
+	NodeSelector     map[string]string `json:"nodeSelector,omitempty"`
+	Layers           []LayerEntry      `json:"layers"`
+}
+
+type Images struct {
+	Tiler string `json:"tiler"`
+	Sync  string `json:"sync"`
+	Proxy string `json:"proxy"`
+}
+
+type LayerEntry struct {
+	ID               string `json:"id"`
+	Title            string `json:"title"`
+	Group            string `json:"group"`
+	ConfigMap        string `json:"configMap"`
+	GeojsonConfigMap string `json:"geojsonConfigMap"`
+	MinioPath        string `json:"minioPath"`
+	Proxy            bool   `json:"proxy"`
+}
+
+var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+func loadRegistry(file string) (*Registry, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("读取图层清单失败: %w", err)
+	}
+	var r Registry
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("解析图层清单失败: %w", err)
+	}
+	if r.Namespace == "" {
+		r.Namespace = "default"
+	}
+	if r.GeojsonMountPath == "" {
+		r.GeojsonMountPath = "/app/geojson"
+	}
+	if r.JobTTLSeconds == 0 {
+		r.JobTTLSeconds = 7 * 24 * 3600
+	}
+	if r.Images.Tiler == "" || r.Images.Sync == "" {
+		return nil, fmt.Errorf("图层清单缺少 images.tiler / images.sync")
+	}
+	seen := map[string]bool{}
+	for _, l := range r.Layers {
+		if !dnsLabel.MatchString(l.ID) || len(l.ID) > 40 {
+			return nil, fmt.Errorf("图层 id %q 需为小写字母数字和连字符，且不超过 40 字符", l.ID)
+		}
+		if seen[l.ID] {
+			return nil, fmt.Errorf("图层 id %q 重复", l.ID)
+		}
+		seen[l.ID] = true
+		if l.ConfigMap == "" || l.GeojsonConfigMap == "" {
+			return nil, fmt.Errorf("图层 %q 缺少 configMap / geojsonConfigMap", l.ID)
+		}
+		if l.Proxy && (r.Images.Proxy == "" || r.ProxyConfigMap == "") {
+			return nil, fmt.Errorf("图层 %q 需要代理，但清单缺少 images.proxy / proxyConfigMap", l.ID)
+		}
+	}
+	return &r, nil
+}
+
+func (r *Registry) layer(id string) (*LayerEntry, bool) {
+	for i := range r.Layers {
+		if r.Layers[i].ID == id {
+			return &r.Layers[i], true
+		}
+	}
+	return nil, false
+}
+
+// pmtilesKey 与 pmtiles-sync/sync.sh 的上传路径保持一致：<MINIO_PATH>/<tm.name 空格换下划线>.pmtiles
+func pmtilesKey(minioPath, tileName string) string {
+	name := strings.ReplaceAll(tileName, " ", "_") + ".pmtiles"
+	if minioPath == "" {
+		return name
+	}
+	return strings.Trim(minioPath, "/") + "/" + name
+}
+
+// ---- 区域 geojson ----
+
+var keyChars = regexp.MustCompile(`[^a-z0-9_-]+`)
+
+// regionKey 把用户输入的名称转成 ConfigMap 可用的 key（[-._a-zA-Z0-9]）。
+func regionKey(name string, now time.Time) string {
+	k := keyChars.ReplaceAllString(strings.ToLower(strings.TrimSpace(name)), "-")
+	k = strings.Trim(k, "-_")
+	if len(k) > 40 {
+		k = k[:40]
+	}
+	stamp := now.Format("20060102-150405")
+	if k == "" {
+		return "region-" + stamp + ".geojson"
+	}
+	return k + "-" + stamp + ".geojson"
+}
+
+type geoFeature struct {
+	Type       string         `json:"type"`
+	Properties map[string]any `json:"properties"`
+	Geometry   struct {
+		Type        string          `json:"type"`
+		Coordinates json.RawMessage `json:"coordinates"`
+	} `json:"geometry"`
+}
+
+type geoCollection struct {
+	Type     string       `json:"type"`
+	Name     string       `json:"name,omitempty"`
+	Features []geoFeature `json:"features"`
+}
+
+// normalizeRegion 校验区域并输出 tiler 能读的 FeatureCollection（只允许 Polygon / MultiPolygon）。
+func normalizeRegion(raw json.RawMessage, name string) ([]byte, error) {
+	var fc geoCollection
+	if err := json.Unmarshal(raw, &fc); err != nil {
+		return nil, fmt.Errorf("geojson 无法解析: %w", err)
+	}
+	if fc.Type != "FeatureCollection" || len(fc.Features) == 0 {
+		return nil, errors.New("geojson 必须是非空 FeatureCollection")
+	}
+	for i, f := range fc.Features {
+		switch f.Geometry.Type {
+		case "Polygon":
+			var rings [][][]float64
+			if err := json.Unmarshal(f.Geometry.Coordinates, &rings); err != nil {
+				return nil, fmt.Errorf("第 %d 个要素坐标无效: %w", i+1, err)
+			}
+			if err := checkRings(rings); err != nil {
+				return nil, fmt.Errorf("第 %d 个要素: %w", i+1, err)
+			}
+		case "MultiPolygon":
+			var polys [][][][]float64
+			if err := json.Unmarshal(f.Geometry.Coordinates, &polys); err != nil {
+				return nil, fmt.Errorf("第 %d 个要素坐标无效: %w", i+1, err)
+			}
+			for _, rings := range polys {
+				if err := checkRings(rings); err != nil {
+					return nil, fmt.Errorf("第 %d 个要素: %w", i+1, err)
+				}
+			}
+		default:
+			return nil, fmt.Errorf("第 %d 个要素类型为 %q，只支持 Polygon / MultiPolygon", i+1, f.Geometry.Type)
+		}
+		if fc.Features[i].Properties == nil {
+			fc.Features[i].Properties = map[string]any{}
+		}
+		fc.Features[i].Type = "Feature"
+		// tiler 的 loadFeatureCollection 会丢弃 name=original 的要素，这里避免误伤
+		if v, _ := fc.Features[i].Properties["name"].(string); v == "original" {
+			delete(fc.Features[i].Properties, "name")
+		}
+	}
+	fc.Name = name
+	return json.Marshal(fc)
+}
+
+func checkRings(rings [][][]float64) error {
+	if len(rings) == 0 {
+		return errors.New("多边形没有环")
+	}
+	for _, ring := range rings {
+		if len(ring) < 4 {
+			return errors.New("多边形环至少需要 4 个点（首尾闭合）")
+		}
+		for _, p := range ring {
+			if len(p) < 2 || math.IsNaN(p[0]) || math.IsNaN(p[1]) || p[0] < -180 || p[0] > 180 || p[1] < -85.06 || p[1] > 85.06 {
+				return fmt.Errorf("坐标 %v 超出经纬度范围", p)
+			}
+		}
+		first, last := ring[0], ring[len(ring)-1]
+		if first[0] != last[0] || first[1] != last[1] {
+			return errors.New("多边形环未闭合")
+		}
+	}
+	return nil
+}
+
+// ---- Job ----
+
+const (
+	labelManaged  = "app.kubernetes.io/managed-by"
+	managedValue  = "tiler-console"
+	labelLayer    = "tiler-console/layer"
+	labelTileName = "tiler-console/tile-name"
+	annoReason    = "tiler-console/reason"
+	annoProxy     = "tiler-console/proxy"
+)
+
+// tileNameLabel 把目录名转成合法 label 值，用来判断两个图层是否写同一个目录。
+func tileNameLabel(name string) string {
+	v := keyChars.ReplaceAllString(strings.ToLower(name), "-")
+	v = strings.Trim(v, "-_")
+	if len(v) > 63 {
+		v = v[:63]
+	}
+	return v
+}
+
+func jobName(layerID string, now time.Time) string {
+	return "tc-" + layerID + "-" + now.Format("0102-150405")
+}
+
+func envFromCM(name, cm, key string, optional bool) map[string]any {
+	ref := map[string]any{"name": cm, "key": key}
+	if optional {
+		ref["optional"] = true
+	}
+	return map[string]any{"name": name, "valueFrom": map[string]any{"configMapKeyRef": ref}}
+}
+
+// buildJob 生成「下载 → 打包上传」Job：
+// 代理是原生 sidecar（initContainer + restartPolicy: Always），下载是普通 initContainer，
+// 下载结束后 sync 才启动，因此不依赖输出目录里残留的 .done。
+// ProxyOpt 是单次派发的下载代理设置。
+type ProxyOpt struct {
+	Mode string `json:"mode"` // default / direct / pool / upstream
+	URL  string `json:"url,omitempty"`
+}
+
+var proxySchemes = map[string]bool{"http": true, "https": true, "socks5": true, "socks5h": true}
+
+// resolve 校验并把 default 落到图层清单的设置上，返回最终模式。
+func (p ProxyOpt) resolve(l *LayerEntry, r *Registry) (ProxyOpt, error) {
+	switch p.Mode {
+	case "", "default":
+		if l.Proxy {
+			return ProxyOpt{Mode: "default"}, nil
+		}
+		return ProxyOpt{Mode: "direct"}, nil
+	case "direct":
+		return ProxyOpt{Mode: "direct"}, nil
+	case "pool", "upstream":
+		if r.Images.Proxy == "" {
+			return p, errors.New("图层清单未配置 images.proxy，无法使用代理")
+		}
+		if p.Mode == "pool" && strings.TrimSpace(p.URL) == "" {
+			return ProxyOpt{Mode: "pool"}, nil // 用 ConfigMap 里的 PROXY_POOL_API
+		}
+		u, err := url.Parse(strings.TrimSpace(p.URL))
+		if err != nil || u.Host == "" {
+			return p, fmt.Errorf("代理地址无效: %q", p.URL)
+		}
+		if p.Mode == "upstream" && !proxySchemes[u.Scheme] {
+			return p, fmt.Errorf("上游代理只支持 http / https / socks5 / socks5h，收到 %q", u.Scheme)
+		}
+		if p.Mode == "pool" && u.Scheme != "http" && u.Scheme != "https" {
+			return p, fmt.Errorf("代理池 API 需为 http(s) 地址，收到 %q", u.Scheme)
+		}
+		return ProxyOpt{Mode: p.Mode, URL: u.String()}, nil
+	}
+	return p, fmt.Errorf("未知代理模式 %q", p.Mode)
+}
+
+// describe 给页面展示用，隐去代理地址里的账号密码。
+func (p ProxyOpt) describe() string {
+	shown := p.URL
+	if u, err := url.Parse(p.URL); err == nil && u.User != nil {
+		u.User = url.User("***")
+		shown = u.String()
+	}
+	switch p.Mode {
+	case "default":
+		return "按图层默认（tiler-proxy-config）"
+	case "direct":
+		return "直连"
+	case "pool":
+		if shown == "" {
+			return "代理池（tiler-proxy-config）"
+		}
+		return "代理池 " + shown
+	case "upstream":
+		return "固定上游 " + shown
+	}
+	return p.Mode
+}
+
+func buildJob(r *Registry, l *LayerEntry, conf *TilerConf, name, reason string, proxy ProxyOpt) map[string]any {
+	volumes := []any{
+		map[string]any{"name": "config", "configMap": map[string]any{"name": l.ConfigMap}},
+		map[string]any{"name": "geojson", "configMap": map[string]any{"name": l.GeojsonConfigMap}},
+		map[string]any{"name": "output", "persistentVolumeClaim": map[string]any{"claimName": r.OutputPVC}},
+	}
+	outputDir := conf.Output.Directory
+	if outputDir == "" {
+		outputDir = "/data/output"
+	}
+	downloadMounts := []any{
+		map[string]any{"name": "config", "mountPath": "/etc/tiler"},
+		map[string]any{"name": "geojson", "mountPath": r.GeojsonMountPath},
+		map[string]any{"name": "output", "mountPath": outputDir},
+	}
+	var initContainers []any
+	var downloadEnv []any
+	if proxy.Mode != "direct" {
+		// 每个 Job 独立的 /tmp/proxy：ready 标记和切换触发文件不与其他 Job 共享
+		volumes = append(volumes, map[string]any{"name": "proxy-data", "emptyDir": map[string]any{}})
+		downloadMounts = append(downloadMounts, map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"})
+		var proxyEnv []any
+		switch proxy.Mode {
+		case "upstream":
+			proxyEnv = []any{map[string]any{"name": "UPSTREAM_PROXY", "value": proxy.URL}}
+		case "pool":
+			if proxy.URL != "" {
+				proxyEnv = []any{map[string]any{"name": "PROXY_POOL_API", "value": proxy.URL}}
+			} else {
+				proxyEnv = []any{envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true)}
+			}
+		default:
+			proxyEnv = []any{
+				envFromCM("UPSTREAM_PROXY", r.ProxyConfigMap, "UPSTREAM_PROXY", true),
+				envFromCM("PROXY_POOL_API", r.ProxyConfigMap, "PROXY_POOL_API", true),
+			}
+		}
+		initContainers = append(initContainers, map[string]any{
+			"name":            "proxy",
+			"image":           r.Images.Proxy,
+			"imagePullPolicy": "Always",
+			"restartPolicy":   "Always",
+			"env":             proxyEnv,
+			"volumeMounts":    []any{map[string]any{"name": "proxy-data", "mountPath": "/tmp/proxy"}},
+			"resources":       resources("100m", "64Mi", "500m", "128Mi"),
+		})
+		downloadEnv = []any{
+			map[string]any{"name": "HTTP_PROXY", "value": "http://localhost:8080"},
+			map[string]any{"name": "HTTPS_PROXY", "value": "http://localhost:8080"},
+		}
+	}
+	download := map[string]any{
+		"name":            "download",
+		"image":           r.Images.Tiler,
+		"imagePullPolicy": "Always",
+		"command":         []any{"./tiler", "-c", "/etc/tiler/conf.toml"},
+		"volumeMounts":    downloadMounts,
+		"resources":       resources("500m", "256Mi", "2", "512Mi"),
+	}
+	if downloadEnv != nil {
+		download["env"] = downloadEnv
+	}
+	initContainers = append(initContainers, download)
+
+	sync := map[string]any{
+		"name":            "sync",
+		"image":           r.Images.Sync,
+		"imagePullPolicy": "Always",
+		"env": []any{
+			map[string]any{"name": "INPUT_DIR", "value": outputDir},
+			map[string]any{"name": "TILE_NAME", "value": conf.TM.Name},
+			map[string]any{"name": "MINIO_PATH", "value": l.MinioPath},
+			envFromCM("MINIO_ENDPOINT", r.MinioConfigMap, "MINIO_ENDPOINT", false),
+			envFromCM("MINIO_BUCKET", r.MinioConfigMap, "MINIO_BUCKET", false),
+			envFromCM("MINIO_ACCESS_KEY", r.MinioConfigMap, "MINIO_ACCESS_KEY", false),
+			map[string]any{"name": "MINIO_SECRET_KEY", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": r.MinioSecret, "key": "MINIO_SECRET_KEY"}}},
+		},
+		"volumeMounts": []any{map[string]any{"name": "output", "mountPath": outputDir, "readOnly": true}},
+		"resources":    resources("500m", "512Mi", "2", "2Gi"),
+	}
+
+	labels := map[string]string{
+		labelManaged:  managedValue,
+		labelLayer:    l.ID,
+		labelTileName: tileNameLabel(conf.TM.Name),
+	}
+	podSpec := map[string]any{
+		"restartPolicy":  "Never",
+		"initContainers": initContainers,
+		"containers":     []any{sync},
+		"volumes":        volumes,
+	}
+	if len(r.NodeSelector) > 0 {
+		podSpec["nodeSelector"] = r.NodeSelector
+	}
+	return map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata": map[string]any{
+			"name":        name,
+			"namespace":   r.Namespace,
+			"labels":      labels,
+			"annotations": map[string]string{annoReason: reason, annoProxy: proxy.describe()},
+		},
+		"spec": map[string]any{
+			"backoffLimit":            1,
+			"ttlSecondsAfterFinished": r.JobTTLSeconds,
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": labels},
+				"spec":     podSpec,
+			},
+		},
+	}
+}
+
+func resources(reqCPU, reqMem, limCPU, limMem string) map[string]any {
+	return map[string]any{
+		"requests": map[string]any{"cpu": reqCPU, "memory": reqMem},
+		"limits":   map[string]any{"cpu": limCPU, "memory": limMem},
+	}
+}
+
+func geojsonBase(p string) string { return path.Base(p) }

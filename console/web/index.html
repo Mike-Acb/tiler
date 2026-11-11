@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>瓦片控制台</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22%3E%3Cpath d=%22M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3z%22 fill=%22%234fb3a6%22/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3z" fill="currentColor" opacity=".9"/><path d="M13 13h8v8h-8z" fill="currentColor" opacity=".35"/></svg>
+    <span>瓦片控制台</span>
+  </div>
+  <div class="topbar-meta">
+    <span class="chip" id="ns-chip">—</span>
+    <span class="chip warn" id="dry-chip" hidden>演练模式 · 写操作不落地</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="btn ghost" id="lock-btn" type="button"></button>
+  </div>
+</header>
+
+<main class="shell">
+  <aside class="sidebar">
+    <div class="side-head">
+      <h2>图层</h2>
+      <button class="icon-btn" id="refresh-layers" type="button" title="刷新">↻</button>
+    </div>
+    <div id="layer-list" class="layer-list"><div class="empty">加载中…</div></div>
+  </aside>
+
+  <section class="map-wrap">
+    <div id="map"></div>
+    <div class="map-hud" id="map-hud"></div>
+    <div class="draw-hint" id="draw-hint" hidden></div>
+    <section class="log-drawer" id="log-drawer" hidden>
+      <div class="log-head">
+        <div class="log-title">
+          <strong id="log-job">—</strong>
+          <span class="muted" id="log-pod"></span>
+        </div>
+        <div class="log-tabs" id="log-tabs"></div>
+        <label class="check"><input type="checkbox" id="log-follow" checked> 跟随</label>
+        <button class="icon-btn" id="log-close" type="button" title="关闭">✕</button>
+      </div>
+      <pre class="log-body" id="log-body"></pre>
+    </section>
+  </section>
+
+  <aside class="panel" id="panel">
+    <div class="empty pad">在左侧选择一个图层</div>
+  </aside>
+</main>
+
+<dialog id="auth-dlg" class="dlg">
+  <form method="dialog" id="auth-form">
+    <h3>输入控制台口令</h3>
+    <p class="muted">派发下载、删除任务需要口令；浏览地图和查看日志不需要。</p>
+    <input type="password" id="auth-input" autocomplete="current-password" placeholder="口令" required>
+    <p class="err" id="auth-err"></p>
+    <div class="dlg-actions">
+      <button class="btn ghost" value="cancel" formnovalidate type="submit">取消</button>
+      <button class="btn primary" value="ok" type="submit">解锁</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm-dlg" class="dlg">
+  <form method="dialog">
+    <h3 id="confirm-title">确认</h3>
+    <div id="confirm-body"></div>
+    <div class="dlg-actions">
+      <button class="btn ghost" value="cancel" type="submit">取消</button>
+      <button class="btn primary" value="ok" type="submit" id="confirm-ok">确认</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
