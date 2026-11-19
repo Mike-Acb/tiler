@@ -31,6 +31,8 @@ const state = {
   copy: null,           // 复制已配置区域：{ layer, title, key, cm, min, max }
   targets: new Set(),   // 「派发到图层」勾选的图层 id
   multiResult: null,    // 多图层派发结果 [{ t, ok, job?, msg? }]
+  // 派发表单里的选择：表单会随切图层、切标签、复制区域重绘，选择存在这里才不会被重置
+  dispatchOpts: { proxy: "default", proxyUrl: "", autoPack: false },
   draw: { mode: null, points: [], start: null },
   jobs: [],
   showLegacy: false,
@@ -787,6 +789,9 @@ function renderRegions() {
       </div>`).join("");
   const zmin = Math.max(0, (l && l.confMax) ? Math.min(l.confMax + 1, 18) : 13);
   const proxyEnabled = state.info.proxy;
+  const opts = state.dispatchOpts;
+  if (!proxyEnabled && (opts.proxy === "pool" || opts.proxy === "upstream")) opts.proxy = "default";
+  const sel = (v) => (opts.proxy === v ? " selected" : "");
   body.innerHTML = `
     <div class="section">
       <h3>已配置区域 <span class="muted" style="letter-spacing:0;font-weight:400">单击定位 · Alt+单击隐藏</span></h3>
@@ -816,16 +821,16 @@ function renderRegions() {
       <div class="targets" id="targets"></div>
       <label class="field"><span>下载代理</span>
         <select id="f-proxy">
-          <option value="default">按图层默认${l && l.proxy ? "（tiler-proxy-config）" : "（直连）"}</option>
-          <option value="direct">直连，不走代理</option>
-          <option value="pool" ${proxyEnabled ? "" : "disabled"}>代理池</option>
-          <option value="upstream" ${proxyEnabled ? "" : "disabled"}>固定上游代理</option>
+          <option value="default"${sel("default")}>按图层默认${l && l.proxy ? "（tiler-proxy-config）" : "（直连）"}</option>
+          <option value="direct"${sel("direct")}>直连，不走代理</option>
+          <option value="pool"${sel("pool")} ${proxyEnabled ? "" : "disabled"}>代理池</option>
+          <option value="upstream"${sel("upstream")} ${proxyEnabled ? "" : "disabled"}>固定上游代理</option>
         </select>
       </label>
-      <label class="field" id="f-proxy-url-wrap" hidden><span id="f-proxy-url-label">代理地址</span><input id="f-proxy-url" spellcheck="false"></label>
+      <label class="field" id="f-proxy-url-wrap" hidden><span id="f-proxy-url-label">代理地址</span><input id="f-proxy-url" spellcheck="false" value="${esc(opts.proxyUrl)}"></label>
       <p class="hint" id="proxy-hint"></p>
       ${state.info.storage && state.info.storage.upload
-        ? '<label class="check autopack"><input type="checkbox" id="f-autopack"> 下载完成后自动打包上传</label><p class="hint" id="autopack-hint"></p>'
+        ? `<label class="check autopack"><input type="checkbox" id="f-autopack"${opts.autoPack ? " checked" : ""}> 下载完成后自动打包上传</label><p class="hint" id="autopack-hint"></p>`
         : `<p class="hint">${esc((state.info.storage && state.info.storage.uploadReason) || "未配置上传存储")}。下载结果在下载目录里，可在地图左上角切到「A 下载目录」查看。</p>`}
       <div class="actions">
         <button class="btn primary" id="dispatch-btn" type="button">派发下载</button>
@@ -867,9 +872,9 @@ function renderRegions() {
   });
   $("#clear-btn").addEventListener("click", () => { stopDraw(); setDraft(null); });
   ["#f-min", "#f-max", "#f-name"].forEach((s) => $(s).addEventListener("input", () => { renderEstimate(); renderTargets(); renderDispatchState(); }));
-  $("#f-proxy").addEventListener("change", renderProxyField);
-  $("#f-proxy-url").addEventListener("input", renderDispatchState);
-  $("#f-autopack")?.addEventListener("change", renderAutopackHint);
+  $("#f-proxy").addEventListener("change", (e) => { state.dispatchOpts.proxy = e.target.value; renderProxyField(); });
+  $("#f-proxy-url").addEventListener("input", (e) => { state.dispatchOpts.proxyUrl = e.target.value; renderDispatchState(); });
+  $("#f-autopack")?.addEventListener("change", (e) => { state.dispatchOpts.autoPack = e.target.checked; renderAutopackHint(); });
   $("#dispatch-btn").addEventListener("click", dispatchRegion);
   $("#rerun-btn").addEventListener("click", rerun);
   if (state.copy) {
